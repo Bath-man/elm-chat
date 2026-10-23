@@ -4,7 +4,7 @@
 
 [Changelog](CHANGELOG.md) · [Latest release](https://github.com/shawnbure/elm-chat/releases/latest)
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](../../../LICENSE)
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://elm.chat/deploy/cloudflare?source=github-readme)
 [![Built with Cloudflare](https://workers.cloudflare.com/built-with-cloudflare.svg)](https://elm.chat/building-ephemeral-chat-cloudflare)
 [![Stars](https://img.shields.io/github/stars/shawnbure/elm-chat?style=social)](https://github.com/shawnbure/elm-chat/stargazers)

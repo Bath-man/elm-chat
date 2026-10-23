@@ -9,7 +9,7 @@ localization, a self-host smoke report, and message protocol v3.
 Current public help-wanted work:
 
 - [Independent security review wanted: protocol, browser client, and room lifecycle](https://github.com/shawnbure/elm-chat/issues/56)
-- Review the completed [signed-event, replay, key-rotation, transfer, and recovery roadmap](../../../../README.md#security-work-that-still-matters) from issues #106–#110 and report a narrowly reproduced defect.
+- Review the completed [signed-event, replay, key-rotation, transfer, and recovery roadmap](../README.md#security-work-that-still-matters) from issues #106–#110 and report a narrowly reproduced defect.
 
 The independent review can be taken in one bounded slice:
 

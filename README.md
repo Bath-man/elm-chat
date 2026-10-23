@@ -43,9 +43,13 @@ npm ci
 - 原有 AES-GCM、ECDH 密钥协商、ECDSA 签名、成员变更密钥轮换、身份/邀请校验保留。
 - `notice.request`、`notice.ack`、`poll.request`、`poll.answer` 是**原加密文字载荷内**的类型，不是明文 WebSocket 事件；中继只转发密文，不保存聊天正文。
 - IndexedDB 保存本机聊天正文和待发送消息；刷新后恢复。互动请求有唯一 ID，回答有稳定关联 ID，重复事件不会生成重复回答。
+- 历史默认显示最近约100条，上翻分批加载并保持阅读位置；收到新消息时，仅在底部自动跟随。查找仅覆盖已加载的可见消息。
+- 聊天菜单支持「导出记录」「导入记录」：完整历史在浏览器本地使用密码加密为 `.achat`（AES-GCM + PBKDF2，随机盐与 IV），导出不受加载条数限制。导入保留时间、内容和类型，按消息 ID 去重；只保存到本机，不发送给对方，也不触发旧互动。密码错误或文件损坏会提示失败。
+- 支持点赞、涂改、置顶、骰子和隐藏文字。连续点赞的爱心独立播放，带小幅随机飘动与渐隐，不互相替换。
 - 对方离线时消息显示“待发送”，本机页面重连且对方上线后尝试发送。不是云端离线邮箱，也不提供已读/保证送达回执。
 - V1 创建的房间不设置消息或房间自动过期。服务器只持久化房间元数据、邀请和准入身份。
 - **本机记录是明文，不是设备端加密备份**。清理网站数据会丢失历史。不要在公用设备使用。
+- `.achat` 仅加密导出文件，不会加密 IndexedDB；密码不上传服务器，忘记密码无法解密备份。备份文件和密码请自行妥善保管。
 - 身份沿用上游的标签页 sessionStorage，刷新可续用；关闭标签、换浏览器/域名或清除会话可能无法再加入已占席房间。V1 无账号恢复、跨设备历史或历史列表。
 - 手机浏览器后台/锁屏时可能暂停 WebSocket；“立即弹出”指页面在线收到事件后立即展示，不是系统推送通知。
 
@@ -83,7 +87,7 @@ npm test
 npm run build
 ```
 
-实际运行结果和验证边界见 [TEST-RESULTS.md](TEST-RESULTS.md)。项目原先没有独立 ESLint 配置，未新增 lint 依赖；使用 TypeScript、协议检查、构建和功能测试验证。
+实际运行结果和验证边界见 [TEST-RESULTS.md](TEST-RESULTS.md)。现行说明及历史资料入口见[文档索引](docs/README.md)。项目原先没有独立 ESLint 配置，未新增 lint 依赖；使用 TypeScript、协议检查、构建和功能测试验证。
 
 可选手机浏览器自动化脚本：`scripts/mobile-smoke.mjs`。使用外部安装的 Playwright，不是应用运行依赖：
 
@@ -107,13 +111,13 @@ npm run package
 主要改动：
 - `apps/web/src/App.tsx` / `styles.css`：手机首页、房间、原通信接入、本地待发送队列。
 - `interactions.ts` / `InteractionDialogs.tsx`：互动载荷、去重、全屏表单。
-- `history.ts`：原生 IndexedDB。
+- `history.ts` / `history-archive.ts`：原生 IndexedDB 分页、合并去重和本地加密备份。
 - `apps/server/`：Node HTTP/WebSocket 服务、房间准入和 CloudBase 元数据持久化。
 
-不提供账号、群聊、文件/图片/音视频、云同步、导出或后台。仓库保留部分上游工具、文档与未使用前端代码，以免无关大规模重构；其中 Cloudflare 相关历史说明不参与本版构建或部署。
+不提供账号、群聊、聊天附件/图片/音视频、云同步或管理后台；`.achat` 是本机记录备份，不是向对方发送文件。保留部分上游工具与未使用前端代码，以免无关大规模重构；其历史文档已归档，不参与本版构建或部署。
 
 ## 原项目与许可证
 
-上游：[elm-chat](https://github.com/shawnbure/elm-chat)，基线提交 `4c3c46cafa8cf2af3fff0b9ed2e7d28cc7d08f41`。原 README 保留在 `README.upstream.md`，许可证原文保留在 `LICENSE`。
+上游：[elm-chat](https://github.com/shawnbure/elm-chat)，基线提交 `4c3c46cafa8cf2af3fff0b9ed2e7d28cc7d08f41`。原 README、变更日志和技术说明保留在[上游归档](docs/archive/upstream/README.md)，许可证原文保留在 [LICENSE](LICENSE)。
 
 本修改版继续使用 **GNU AGPL-3.0**。对外提供修改版网络服务时，应向用户提供对应版本完整源码与构建/运行所需文件，并保留原有许可证和相关声明。本项目提供 `/source.zip` 下载入口；发布前须重新打包以匹配运行版本。

@@ -1,37 +1,17 @@
-# elm.chat
+# 极简匿名聊天
 
-> elm.chat is an open-source, account-free, end-to-end encrypted messenger for short-lived conversations. A creator opens a room, sends one single-use invite to one known person, and the room disappears when the conversation ends.
+本项目基于 elm-chat，使用 React/Vite 与 Node.js HTTP/WebSocket，生产部署到腾讯 CloudBase；运行不依赖 Cloudflare。
 
-elm.chat is an early-stage experiment in minimizing the transcript a chat service retains. It is not an anonymity network, an audited high-assurance security product, a compliance product, or a tool for anonymous or high-risk source protection. No independent security audit has been completed. Message authentication and replay protection are unfinished. Cloudflare can observe ordinary relay metadata such as IP addresses, connection timing, presence, and encrypted payload sizes. Participant devices and recipients can retain anything they receive.
+## 功能与边界
 
-## Start here
+- 无账号、两人邀请、端到端加密文字聊天，支持提醒、单选调查及轻量互动。
+- 聊天历史保存在浏览器 IndexedDB，服务器仅持久化房间元数据，不保存聊天正文或密文历史。
+- 最近约100条历史优先显示，上翻分页；浏览器可用密码加密导出完整 .achat 备份，导入去重且仅本地显示，不发送给对方或重放旧互动。
+- IndexedDB 本身仍保存明文；备份加密不能保护已失陷的设备，也不能阻止对方保留内容。
+- 不提供群聊、聊天附件、云同步、账号恢复或系统推送；不宣称独立安全审计完成。
 
-- [Try elm.chat](https://elm.chat/?source=llms-txt): Open a room and invite exactly one known person. Use non-critical information while the project is early-stage.
-- [Source code and README](https://github.com/shawnbure/elm-chat): Review the AGPL-3.0-or-later repository, local-development instructions, architecture, limitations, and contribution routes.
-- [Security status and limitations](https://elm.chat/security-and-limitations): Read the current guarantees, known protocol gaps, metadata boundary, destruction limits, and private reporting route.
-- [Threat model](https://github.com/shawnbure/elm-chat/blob/main/docs/threat-model.md): Inspect protected assets, trust assumptions, known threats, and non-goals.
-- [Security policy](https://github.com/shawnbure/elm-chat/blob/main/SECURITY.md): Report suspected vulnerabilities privately through GitHub Security Advisories.
+## 说明与源码
 
-## Technical context
+页面底部的 /source.zip 提供对应版本源码。包内 README.md 是当前运行指南，docs/README.md 是文档索引，docs/cloudbase-deploy.md 是部署教程，TEST-RESULTS.md 记录验证边界。
 
-- [Architecture](https://github.com/shawnbure/elm-chat/blob/main/docs/architecture.md): Understand the React client, Cloudflare Worker, Durable Objects, WebSockets, client-side cryptography, and room lifecycle.
-- [Protocol](https://github.com/shawnbure/elm-chat/blob/main/docs/protocol.md): Review the wire protocol and current cryptographic design.
-- [Building ephemeral chat with Cloudflare](https://elm.chat/building-ephemeral-chat-cloudflare): Read the implementation walkthrough and its engineering tradeoffs.
-- [Fix Deploy to Cloudflare in a monorepo](https://elm.chat/cloudflare-deploy-button-monorepo): Diagnose nested Wrangler configuration, expose a root deployment contract, prevent config drift, and test the public setup path.
-- [Single-use invite links as capabilities](https://elm.chat/single-use-invite-links): Separate routing, admission, decryption, creator control, expiry, revocation, at-most-once consumption, and reconnect semantics.
-- [Deletion as a distributed-systems contract](https://elm.chat/deletion-distributed-systems-contract): Model state inventories, tombstones, recovery, resurrection failures, and verifiable deletion claims.
-- [Durable Objects WebSocket hibernation](https://elm.chat/durable-objects-websocket-hibernation): See how the relay handles sleeping connections without a chat-message database.
-- [Contributing](https://github.com/shawnbure/elm-chat/blob/main/CONTRIBUTING.md): Find development standards and ways to help.
-
-## Product context
-
-- [Why I built elm.chat](https://elm.chat/why-i-built-elm-chat): Read the founder's case for communication that does not automatically become a permanent archive.
-- [What self-destructing chat should mean](https://elm.chat/self-destructing-chat): Compare deletion claims, server retention, metadata, endpoints, and audit status.
-- [One-time secret or disposable chat](https://elm.chat/one-time-secret-chat): Choose between a one-way secret and a short-lived two-person conversation.
-- [Press and media kit](https://elm.chat/press): Find accurate descriptions, founder context, screenshots, and claims that should remain qualified.
-
-## Optional practical guides
-
-- [Send a password without leaving it in chat history](https://elm.chat/send-a-password-securely): A limited-risk workflow with explicit caveats.
-- [Send a file without creating another attachment archive](https://elm.chat/send-a-file-securely): A practical workflow and its endpoint limitations.
-- [Temporary private chat without signup](https://elm.chat/temporary-private-chat): How the account-free room flow works.
+docs/archive/ 保留上游 Cloudflare 文档和已完成计划，不是当前部署指南。项目使用 GNU AGPL-3.0，保留上游出处及许可证。

@@ -16,7 +16,7 @@ with ZipFile(output, 'w', ZIP_DEFLATED) as archive:
         for name in sorted(files):
             path = Path(directory) / name
             rel = path.relative_to(root)
-            if name in {'source.zip', 'AGENTS.md'} or (name.startswith(('.env', '.dev.vars')) and name != '.env.example') or path.suffix in {'.log', '.pem', '.key'}:
+            if name in {'source.zip', 'AGENTS.md'} or name.startswith(('.omx', '.codex')) or (name.startswith(('.env', '.dev.vars')) and name != '.env.example') or path.suffix in {'.log', '.pem', '.key'}:
                 continue
             archive.write(path, str(Path('mobile-anonymous-chat-v1') / rel))
 public = root / 'apps/web/public/source.zip'

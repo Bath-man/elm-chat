@@ -10,6 +10,7 @@
 !.codex/prompts/
 !.codex/prompts/**
 node_modules/
+__pycache__/
 **/dist/
 **/.wrangler/
 artifacts/

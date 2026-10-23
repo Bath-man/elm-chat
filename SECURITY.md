@@ -35,7 +35,7 @@ In scope:
 - the web client (XSS, secret exposure, storage of sensitive material),
 - anything that lets the server, an attacker, or a third party read, retain, or reconstruct message content or deanonymize participants.
 
-Out of scope (known and documented — see `docs/threat-model.md`):
+Out of scope (known and documented — see the [archived upstream threat model](docs/archive/upstream/docs/threat-model.md)):
 
 - compromise of a participant's own device (screenshots, clipboard, malware),
 - a participant voluntarily forwarding plaintext, screenshots, or the room secret,
