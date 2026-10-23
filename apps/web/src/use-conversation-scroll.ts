@@ -6,8 +6,14 @@ export function useConversationScroll(messages: readonly { id: string }[], ready
   const followingRef = useRef(true);
   const previousIdsRef = useRef<ReadonlySet<string>>(new Set());
   const pendingIdsRef = useRef<ReadonlySet<string>>(new Set());
+  const historyAnchorRef = useRef<{ height: number; top: number } | null>(null);
   const [awayFromLatest, setAwayFromLatest] = useState(false);
   const [newMessageCount, setNewMessageCount] = useState(0);
+
+  function preserveHistoryPosition() {
+    const log = chatLogRef.current;
+    if (log) historyAnchorRef.current = { height: log.scrollHeight, top: log.scrollTop };
+  }
 
   function jumpToLatest() {
     followingRef.current = true;
@@ -38,6 +44,15 @@ export function useConversationScroll(messages: readonly { id: string }[], ready
       return;
     }
     const ids = messages.map((message) => message.id);
+    const anchor = historyAnchorRef.current;
+    historyAnchorRef.current = null;
+    if (anchor) {
+      // Use the pre-update height, not native anchoring, to avoid a double adjustment.
+      log.scrollTop = anchor.top + log.scrollHeight - anchor.height;
+      previousIdsRef.current = new Set(ids);
+      handleConversationScroll();
+      return;
+    }
     pendingIdsRef.current = unseenMessageIds(
       previousIdsRef.current, pendingIdsRef.current, ids, followingRef.current && !pauseFollowing
     );
@@ -51,5 +66,5 @@ export function useConversationScroll(messages: readonly { id: string }[], ready
     // In particular, expiration and file updates must not force a jump.
   }, [messages, ready]);
 
-  return { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll };
+  return { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll, preserveHistoryPosition };
 }

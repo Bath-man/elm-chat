@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { loadHistory, saveHistory, type HistoryMessage } from "../apps/web/src/history";
+import { importHistory, loadHistory, loadHistoryPage, saveHistory, type HistoryMessage } from "../apps/web/src/history";
 
 const message: HistoryMessage = {
   id: "one", senderSessionId: "sender", sentAt: 1, kind: "text", plaintext: "hello", delivery: "pending"
@@ -13,14 +13,54 @@ function database() {
   const transaction: Record<string, any> = {};
   const getAll: Record<string, any> = {};
   const put = vi.fn();
+  const get = vi.fn(() => ({}));
+  const cursor: Record<string, any> = {};
+  const openCursor = vi.fn(() => cursor);
   const getAllForScope = vi.fn(() => getAll);
-  transaction.objectStore = () => ({ put, index: () => ({ getAll: getAllForScope }) });
+  transaction.objectStore = () => ({ put, get, index: () => ({ getAll: getAllForScope, openCursor }) });
   const db = { transaction: vi.fn(() => transaction), close: vi.fn() };
   vi.stubGlobal("indexedDB", { open: () => request });
-  return { request, transaction, getAll, getAllForScope, put, db, open() { request.result = db; request.onsuccess(); } };
+  return { request, transaction, getAll, getAllForScope, put, get, cursor, openCursor, db, open() { request.result = db; request.onsuccess(); } };
 }
 
 describe("local chat history", () => {
+  it("reads only one reverse-ordered page, including equal-time IDs", async () => {
+    const storage = database();
+    const bound = vi.fn(() => "range");
+    vi.stubGlobal("IDBKeyRange", { bound });
+    const promise = loadHistoryPage("room", "session", undefined, 2);
+    storage.open();
+    await Promise.resolve();
+    expect(storage.openCursor).toHaveBeenCalledWith("range", "prev");
+    const next = vi.fn();
+    for (const id of ["c", "b", "a"]) {
+      storage.cursor.result = { value: { ...message, id, sentAt: 2, roomId: "room", sessionId: "session" }, continue: next };
+      storage.cursor.onsuccess();
+    }
+    storage.transaction.oncomplete();
+    expect(await promise).toEqual({ messages: [{ ...message, id: "b", sentAt: 2 }, { ...message, id: "c", sentAt: 2 }], hasMore: true });
+    expect(next).toHaveBeenCalledTimes(2);
+    expect(storage.getAllForScope).not.toHaveBeenCalled();
+  });
+
+  it("imports only missing IDs and marks them local-only without pending delivery", async () => {
+    const storage = database();
+    const reads: Record<string, any>[] = [];
+    storage.get.mockImplementation(() => { const request = {}; reads.push(request); return request; });
+    const promise = importHistory("room", "session", [message, { ...message, id: "two" }, { ...message, id: "two" }]);
+    storage.open();
+    await Promise.resolve();
+    reads[0].result = message;
+    reads[0].onsuccess();
+    reads[1].result = undefined;
+    reads[1].onsuccess();
+    storage.transaction.oncomplete();
+    expect(await promise).toBe(1);
+    expect(storage.get).toHaveBeenCalledTimes(2);
+    expect(storage.put).toHaveBeenCalledOnce();
+    expect(storage.put.mock.calls[0][0]).toMatchObject({ id: "two", imported: true, delivery: "sent" });
+  });
+
   it("rejects unavailable storage instead of silently using memory", async () => {
     vi.stubGlobal("indexedDB", undefined);
     await expect(loadHistory("room", "session")).rejects.toThrow();
@@ -33,7 +73,7 @@ describe("local chat history", () => {
     const promise = saveHistory("room", "session", [message]).then(() => { completed = true; });
     storage.open();
     await Promise.resolve();
-    expect(storage.put).toHaveBeenCalledWith({ ...message, roomId: "room", sessionId: "session" });
+    expect(storage.put).toHaveBeenCalledWith({ ...message, roomId: "room", sessionId: "session", context: 1 });
     expect(completed).toBe(false);
     storage.transaction.oncomplete();
     await promise;

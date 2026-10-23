@@ -9,6 +9,13 @@ const render = (overrides = {}) => renderToStaticMarkup(createElement(MessageBub
   message, mine: false, likes: 0, confirmed: false, onLike: async () => true, onEdit: () => {}, ...overrides
 }));
 describe("V1.1 chat bubble", () => {
+  it("keeps imported messages read-only and does not show old requests as waiting", () => {
+    const html = render({ message: { ...message, imported: true } });
+    expect(html).toContain("导入记录");
+    expect(html).not.toContain('aria-label="点赞消息"');
+    expect(render({ message: { ...message, imported: true, plaintext: encodeInteraction({ type: "notice.request", id: "old-notice", text: "旧提醒", color: "#ffffff" }) } })).not.toContain("等待确认");
+  });
+
   it("renders ordinary messages as accessible repeat-like controls", () => {
     const html = render({ likes: 12 });
     expect(html).toContain('aria-label="点赞消息"');

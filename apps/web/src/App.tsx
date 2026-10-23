@@ -46,7 +46,8 @@ import { ThemeToggle } from "./ThemeToggle";
 import { contrastColor, InteractionComposer, InteractionPrompt, MessageEditDialog } from "./InteractionDialogs";
 import { MessageBubble } from "./MessageBubble";
 import { decodeInteraction, deriveInteractionState, encodeInteraction, isStateInteraction, pendingInteractions, type Interaction } from "./interactions";
-import { loadHistory, saveHistory, type HistoryMessage } from "./history";
+import { importHistory, loadHistory, loadHistoryContext, loadHistoryPage, saveHistory, type HistoryCursor, type HistoryMessage } from "./history";
+import { decryptHistory, encryptHistory } from "./history-archive";
 import { recordGrowthEvent, resolveExternalAcquisitionSource } from "./growth";
 import { MarketingPage, type MarketingSlug } from "./MarketingPage";
 import { locale, t } from "./localization";
@@ -92,6 +93,7 @@ type UiMessage = {
   kind: "text" | "file";
   plaintext?: string;
   file?: UiFile;
+  imported?: boolean;
 };
 
 type IncomingFile = {
@@ -485,6 +487,12 @@ function upsertMessage(messages: UiMessage[], next: UiMessage): UiMessage[] {
   return copy;
 }
 
+function mergeHistoryMessages(current: UiMessage[], saved: readonly HistoryMessage[]): UiMessage[] {
+  const merged = new Map<string, UiMessage>(saved.map(message => [message.id, message]));
+  for (const message of current) merged.set(message.id, message);
+  return [...merged.values()].sort((a, b) => a.sentAt - b.sentAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
 function colorFromSessionId(sessionId: string): string {
   let hash = 0;
   for (let index = 0; index < sessionId.length; index += 1) {
@@ -803,17 +811,29 @@ function RoomPage({ roomId }: { roomId: string }) {
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [hiddenHistoryIds, setHiddenHistoryIds] = useState<ReadonlySet<string>>(new Set());
+  const historyCursorRef = useRef<HistoryCursor | undefined>(undefined);
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const loadingHistoryRef = useRef(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [archiveMode, setArchiveMode] = useState<"export" | "import" | null>(null);
+  const [archivePassword, setArchivePassword] = useState("");
+  const [archiveFile, setArchiveFile] = useState<File | null>(null);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveFeedback, setArchiveFeedback] = useState<string | null>(null);
   const [showInteractions, setShowInteractions] = useState(false);
   const [composerKind, setComposerKind] = useState<"notice" | "poll" | "pin" | "hidden">("notice");
   const [showMore, setShowMore] = useState(false);
   const [editingMessage, setEditingMessage] = useState<UiMessage | null>(null);
   const outgoingQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const interactionState = useMemo(() => deriveInteractionState(messages), [messages]);
+  const interactionState = useMemo(() => deriveInteractionState(messages.filter(message => !message.imported)), [messages]);
   const visibleMessages = useMemo(() => messages.filter(message => {
     if (message.kind !== "text") return false;
+    if (hiddenHistoryIds.has(message.id)) return false;
     const value = decodeInteraction(message.plaintext ?? "");
     return !value || !isStateInteraction(value);
-  }), [messages]);
+  }), [messages, hiddenHistoryIds]);
   const [invites, setInvites] = useState<RoomInvite[]>([]);
   const [manualInvite, setManualInvite] = useState<{ token: string; trigger: HTMLButtonElement; focusOwner: Element | null } | null>(null);
   const inviteTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -843,7 +863,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const [keyReady, setKeyReady] = useState(false);
   const [presence, setPresence] = useState<PresenceSnapshot>({ count: 0, connectedSessionIds: [] });
   const [now, setNow] = useState(Date.now());
-  const conversationFind = useConversationFind(messages, now, (id) => {
+  const conversationFind = useConversationFind(visibleMessages, now, (id) => {
     const log = chatLogRef.current;
     const article = log?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
     if (!log || !article) return;
@@ -874,9 +894,13 @@ function RoomPage({ roomId }: { roomId: string }) {
   });
   useEffect(() => {
     let active = true;
-    loadHistory(roomId, sessionId).then((saved) => {
+    Promise.all([loadHistoryPage(roomId, sessionId), loadHistoryContext(roomId, sessionId)]).then(([page, context]) => {
       if (!active) return;
-      setMessages((current) => saved.reduce((all, message) => upsertMessage(all, message), current));
+      historyCursorRef.current = page.messages[0];
+      const pageIds = new Set(page.messages.map(message => message.id));
+      setHiddenHistoryIds(new Set(context.filter(message => !pageIds.has(message.id)).map(message => message.id)));
+      setHasMoreHistory(page.hasMore);
+      setMessages(current => mergeHistoryMessages(current, [...page.messages, ...context]));
       setHistoryLoaded(true);
     }).catch(() => {
       if (active) setError("无法打开本地记录。请允许浏览器使用 IndexedDB 后刷新页面。");
@@ -903,7 +927,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   // by the connection effect) can distinguish a live-room drop from an
   // already-closed room without reading a stale `room` value.
   const roomStatusRef = useRef<RoomMetadata["status"] | null>(null);
-  const { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll } =
+  const { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll, preserveHistoryPosition } =
     useConversationScroll(visibleMessages, ready, conversationFind.open || concealment.hidden);
   const messageRef = useRef(new Map<string, AuthenticatedPeerEvent>());
   const pendingEnvelopesRef = useRef(new Map<string, AuthenticatedPeerEvent>());
@@ -1947,7 +1971,76 @@ function RoomPage({ roomId }: { roomId: string }) {
     };
   }, []);
 
+  async function loadEarlierHistory() {
+    if (!historyLoaded || !hasMoreHistory || loadingHistoryRef.current) return;
+    loadingHistoryRef.current = true;
+    setLoadingHistory(true);
+    try {
+      const page = await loadHistoryPage(roomId, sessionId, historyCursorRef.current);
+      preserveHistoryPosition();
+      if (page.messages.length) {
+        historyCursorRef.current = page.messages[0];
+        setHiddenHistoryIds(current => {
+          const hidden = new Set(current);
+          for (const message of page.messages) hidden.delete(message.id);
+          return hidden;
+        });
+      }
+      setHasMoreHistory(page.hasMore);
+      setMessages(current => mergeHistoryMessages(current, page.messages));
+    } catch { setError("无法加载更早记录，请重试。"); }
+    finally { loadingHistoryRef.current = false; setLoadingHistory(false); }
+  }
+
+  function openArchive(mode: "export" | "import") {
+    setShowMore(false);
+    setArchivePassword("");
+    setArchiveFile(null);
+    setArchiveError(null);
+    setArchiveFeedback(null);
+    setArchiveMode(mode);
+  }
+
+  async function handleArchive() {
+    if (archiveBusy || !archivePassword || !archiveMode) return;
+    setArchiveBusy(true);
+    setArchiveError(null);
+    try {
+      if (archiveMode === "export") {
+        const content = await encryptHistory(await loadHistory(roomId, sessionId), archivePassword);
+        const url = URL.createObjectURL(new Blob([content], { type: "application/octet-stream" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `chat-${new Date().toISOString().slice(0, 10)}.achat`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setArchiveFeedback("完整聊天记录已加密导出。");
+      } else {
+        if (!archiveFile) throw new Error("请选择 .achat 记录文件。");
+        const previousIds = messagesRef.current.map(message => message.id);
+        const saved = await decryptHistory(await archiveFile.text(), archivePassword);
+        const added = await importHistory(roomId, sessionId, saved);
+        const page = await loadHistoryPage(roomId, sessionId);
+        historyCursorRef.current = page.messages[0];
+        const pageIds = new Set(page.messages.map(message => message.id));
+        setHiddenHistoryIds(new Set(previousIds.filter(id => !pageIds.has(id))));
+        setHasMoreHistory(page.hasMore);
+        jumpToLatest();
+        setMessages(current => mergeHistoryMessages(current, page.messages));
+        setArchiveFeedback(`已导入 ${added} 条记录，重复记录已跳过。导入内容仅在本机显示。`);
+      }
+      setArchiveMode(null);
+      setArchivePassword("");
+      setArchiveFile(null);
+    } catch (cause) {
+      setArchiveError(cause instanceof Error ? cause.message : "记录处理失败，请重试。");
+    } finally { setArchiveBusy(false); }
+  }
+
   async function transmitMessage(message: HistoryMessage): Promise<boolean> {
+    if (message.imported) return false;
     const key = roomKeyRef.current;
     const leader = currentKeyLeader();
     if (!key || !leader || !keyReadyRef.current || roomStatusRef.current !== "open" || presence.count < 2) return false;
@@ -2015,7 +2108,7 @@ function RoomPage({ roomId }: { roomId: string }) {
     setSending(true);
     try {
       for (const message of messagesRef.current) {
-        if (message.kind === "text" && message.delivery === "pending" && message.senderSessionId === sessionId) {
+        if (!message.imported && message.kind === "text" && message.delivery === "pending" && message.senderSessionId === sessionId) {
           if (!await transmitMessage(message as HistoryMessage)) break;
         }
       }
@@ -2044,7 +2137,7 @@ function RoomPage({ roomId }: { roomId: string }) {
 
   async function editMessage(start: number, end: number, replacement: string) {
     if (!editingMessage || editingMessage.senderSessionId === sessionId ||
-        deriveInteractionState(messagesRef.current).edits.has(editingMessage.id)) return false;
+        deriveInteractionState(messagesRef.current.filter(message => !message.imported)).edits.has(editingMessage.id)) return false;
     return sendInteraction({ type: "message.edit", id: `edit:${editingMessage.id}`, replyTo: editingMessage.id, start, end, replacement });
   }
 
@@ -2301,8 +2394,8 @@ function RoomPage({ roomId }: { roomId: string }) {
       onRetry={canRetryConnection ? () => retryConnectionRef.current?.() : undefined} />;
   }
 
-  const pending = historyLoaded ? pendingInteractions(messages.filter((m): m is HistoryMessage => m.kind === "text" && typeof m.plaintext === "string"), sessionId) : [];
-  const pendingCount = messages.filter((message) => message.delivery === "pending").length;
+  const pending = historyLoaded ? pendingInteractions(messages.filter((m): m is HistoryMessage => !m.imported && m.kind === "text" && typeof m.plaintext === "string"), sessionId) : [];
+  const pendingCount = messages.filter((message) => !message.imported && message.delivery === "pending").length;
   const inviteLink = invites.find((invite) => canShareInvite(invite, now));
   return <main className="room-shell">
     <header className="room-header">
@@ -2329,8 +2422,12 @@ function RoomPage({ roomId }: { roomId: string }) {
     {error && <p className="error-text room-error" role="alert">{error}</p>}
     {connectionError && <p className="error-text room-error" role="alert">{connectionError}</p>}
     {pendingCount > 0 && <div className="outbox-status" role="status">{pendingCount} 条消息待发送 <button onClick={() => void flushOutbox()} disabled={sending || !keyReady || presence.count < 2}>重试发送</button></div>}
-    <section className="chat-log" aria-label="聊天记录" aria-live="polite" role="log" ref={chatLogRef} onScroll={handleConversationScroll}>
+    <section className="chat-log" aria-label="聊天记录" aria-live="polite" role="log" ref={chatLogRef} onScroll={() => {
+      handleConversationScroll();
+      if (chatLogRef.current && chatLogRef.current.scrollTop < 80) void loadEarlierHistory();
+    }}>
       <div className="chat-thread">
+        {hasMoreHistory && <button type="button" className="secondary-button" disabled={loadingHistory} onClick={() => void loadEarlierHistory()}>{loadingHistory ? "正在加载…" : "加载更早记录"}</button>}
         {historyLoaded && visibleMessages.length === 0 && <p className="system-line">没有消息，打个招呼吧。</p>}
         {visibleMessages.map(message => <MessageBubble key={message.id} message={message}
           mine={message.senderSessionId === sessionId} likes={interactionState.likes.get(message.id) ?? 0}
@@ -2346,6 +2443,8 @@ function RoomPage({ roomId }: { roomId: string }) {
       <div className="composer-tools">
         <button className={`secondary-button composer-plus${showMore ? " is-open" : ""}`} type="button" aria-label="更多功能" aria-expanded={showMore} aria-controls="chat-more-menu" disabled={!historyLoaded} onClick={() => setShowMore(!showMore)}>+</button>
         {showMore && <div id="chat-more-menu" className="more-menu" role="menu" aria-label="聊天工具" onKeyDown={event => { if (event.key === "Escape") setShowMore(false); }}>
+          <button type="button" role="menuitem" onClick={() => openArchive("export")}><span aria-hidden="true">↓</span>导出记录</button>
+          <button type="button" role="menuitem" onClick={() => openArchive("import")}><span aria-hidden="true">↑</span>导入记录</button>
           <button type="button" role="menuitem" onClick={() => openInteraction("notice")}><span aria-hidden="true">◷</span>发送提醒</button>
           <button type="button" role="menuitem" onClick={() => openInteraction("poll")}><span aria-hidden="true">☷</span>单选调查</button>
           <button type="button" role="menuitem" onClick={() => openInteraction("pin")}><span aria-hidden="true">⌁</span>置顶气泡</button>
@@ -2356,6 +2455,18 @@ function RoomPage({ roomId }: { roomId: string }) {
       <textarea aria-label="消息" placeholder="输入消息…" rows={1} maxLength={4000} value={draft} disabled={!historyLoaded || room?.status !== "open"} onChange={(event) => { draftRevisionRef.current += 1; setDraft(event.target.value); }} onKeyDown={handleComposerKeyDown} />
       <button className="primary-button" disabled={sending || !draft.trim() || !historyLoaded || !keyReady}>发送</button>
     </form>
+    {archiveFeedback && <p className="local-note" role="status">{archiveFeedback}</p>}
+    {archiveMode && <div className="interaction-overlay" role="dialog" aria-modal="true" aria-labelledby="archive-title">
+      <form className="interaction-panel" onSubmit={event => { event.preventDefault(); void handleArchive(); }}>
+        <h2 id="archive-title">{archiveMode === "export" ? "导出记录" : "导入记录"}</h2>
+        <p>记录仅在本机加密和解密。请妥善保存密码，丢失后无法恢复。</p>
+        {archiveMode === "import" && <label>记录文件<input type="file" accept=".achat" required disabled={archiveBusy} onChange={event => setArchiveFile(event.target.files?.[0] ?? null)} /></label>}
+        <label>{archiveMode === "export" ? "设置密码" : "输入密码"}<input type="password" autoFocus required autoComplete={archiveMode === "export" ? "new-password" : "off"} value={archivePassword} disabled={archiveBusy} onChange={event => setArchivePassword(event.target.value)} /></label>
+        {archiveError && <p className="error-text" role="alert">{archiveError}</p>}
+        <button className="primary-button" disabled={archiveBusy}>{archiveBusy ? "正在处理…" : archiveMode === "export" ? "加密并导出" : "解密并导入"}</button>
+        <button type="button" disabled={archiveBusy} onClick={() => { setArchiveMode(null); setArchivePassword(""); setArchiveFile(null); }}>取消</button>
+      </form>
+    </div>}
     <p className="local-note">记录仅在本机 · <a href="/source.zip">源码 / AGPL-3.0</a></p>
     {showInteractions && <InteractionComposer initialKind={composerKind} initialPin={interactionState.pin} onSend={sendInteraction} onClose={() => setShowInteractions(false)} />}
     {editingMessage && <MessageEditDialog text={editingMessage.plaintext ?? ""} onSubmit={editMessage} onClose={() => setEditingMessage(null)} />}
