@@ -50,6 +50,10 @@ try {
   assert.equal(await a.locator('.bubble').count(), 0);
   assert.equal(await b.locator('.bubble').count(), 0);
   check('two independent mobile sessions join via invite; no demo messages');
+  const routedCheck = a.waitForResponse(response => new URL(response.url()).pathname === '/api/runtime' && response.status() === 200);
+  await a.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await routedCheck;
+  check('visible room checks the same-origin runtime route for deployment handoff');
   await text(a, '双端文字测试'); await waitText(b, '双端文字测试');
   await text(b, '收到文字'); await waitText(a, '收到文字');
   check('real-time two-way text');

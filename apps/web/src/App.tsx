@@ -40,17 +40,19 @@ import {
   type RoomMetadata,
   type ServerEvent,
 } from "@elm-chat/shared";
-import { startTransition, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { encryptedChatIssue } from "./browser-support";
 import { ThemeToggle } from "./ThemeToggle";
-import { InteractionComposer, InteractionPrompt } from "./InteractionDialogs";
-import { decodeInteraction, encodeInteraction, interactionText, pendingInteractions, type Interaction } from "./interactions";
+import { contrastColor, InteractionComposer, InteractionPrompt, MessageEditDialog } from "./InteractionDialogs";
+import { MessageBubble } from "./MessageBubble";
+import { decodeInteraction, deriveInteractionState, encodeInteraction, isStateInteraction, pendingInteractions, type Interaction } from "./interactions";
 import { loadHistory, saveHistory, type HistoryMessage } from "./history";
 import { recordGrowthEvent, resolveExternalAcquisitionSource } from "./growth";
 import { MarketingPage, type MarketingSlug } from "./MarketingPage";
 import { locale, t } from "./localization";
 import { InvalidMessageEnvelopeError, receiveTextMessage } from "./message-receive";
 import { ReplayGuard } from "./replay";
+import { createTextEnvelope } from "./message-send";
 import { handleComposerKeyDown } from "./composer";
 import { ReconnectScheduler } from "./reconnect";
 import { loadRoomMetadata, RoomMetadataError } from "./room-metadata";
@@ -802,6 +804,16 @@ function RoomPage({ roomId }: { roomId: string }) {
   messagesRef.current = messages;
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [showInteractions, setShowInteractions] = useState(false);
+  const [composerKind, setComposerKind] = useState<"notice" | "poll" | "pin" | "hidden">("notice");
+  const [showMore, setShowMore] = useState(false);
+  const [editingMessage, setEditingMessage] = useState<UiMessage | null>(null);
+  const outgoingQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const interactionState = useMemo(() => deriveInteractionState(messages), [messages]);
+  const visibleMessages = useMemo(() => messages.filter(message => {
+    if (message.kind !== "text") return false;
+    const value = decodeInteraction(message.plaintext ?? "");
+    return !value || !isStateInteraction(value);
+  }), [messages]);
   const [invites, setInvites] = useState<RoomInvite[]>([]);
   const [manualInvite, setManualInvite] = useState<{ token: string; trigger: HTMLButtonElement; focusOwner: Element | null } | null>(null);
   const inviteTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -810,7 +822,6 @@ function RoomPage({ roomId }: { roomId: string }) {
   currentInvitesRef.current = invites;
   const [draft, setDraft] = useState("");
   const draftRevisionRef = useRef(0);
-  const sendingRef = useRef(false);
   const [sending, setSending] = useState(false);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -893,7 +904,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   // already-closed room without reading a stale `room` value.
   const roomStatusRef = useRef<RoomMetadata["status"] | null>(null);
   const { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll } =
-    useConversationScroll(messages, ready, conversationFind.open || concealment.hidden);
+    useConversationScroll(visibleMessages, ready, conversationFind.open || concealment.hidden);
   const messageRef = useRef(new Map<string, AuthenticatedPeerEvent>());
   const pendingEnvelopesRef = useRef(new Map<string, AuthenticatedPeerEvent>());
   const replayGuardRef = useRef<ReplayGuard | null>(null);
@@ -1851,6 +1862,30 @@ function RoomPage({ roomId }: { roomId: string }) {
     return () => window.clearTimeout(timeout);
   }, [destroyFeedback]);
 
+  // HTTP follows the currently published version; an existing WS can still point
+  // at the previous container after rollout. Never use WS frames to request takeover.
+  useEffect(() => {
+    let request: AbortController | undefined;
+    let deadline: number | undefined;
+    const checkRuntime = () => {
+      if (document.hidden || request) return;
+      const controller = new AbortController();
+      request = controller;
+      deadline = window.setTimeout(() => controller.abort(), 5000);
+      void fetch("/api/runtime", { cache: "no-store", signal: controller.signal })
+        .catch(() => {})
+        .finally(() => { window.clearTimeout(deadline); request = undefined; });
+    };
+    checkRuntime();
+    const interval = window.setInterval(checkRuntime, 15000);
+    document.addEventListener("visibilitychange", checkRuntime);
+    return () => {
+      window.clearInterval(interval); window.clearTimeout(deadline);
+      document.removeEventListener("visibilitychange", checkRuntime);
+      request?.abort();
+    };
+  }, [roomId]);
+
   useEffect(() => {
     if (!ready || room?.status !== "open") {
       return;
@@ -1920,11 +1955,7 @@ function RoomPage({ roomId }: { roomId: string }) {
     const keyWorkIsCurrent = captureKeyWork(keyEpoch, leader);
     const isCurrent = () => keyWorkIsCurrent() && roomKeyRef.current === key;
     if (!isCurrent()) return false;
-    const envelope: EncryptedMessageEnvelope = {
-      protocolVersion: MESSAGE_PROTOCOL_VERSION, messageId: generateMessageId(),
-      senderSessionId: sessionId, ciphertext: "", nonce: "", sentAt: Date.now(),
-      expiresAfterReadSeconds: null, keyEpoch
-    };
+    const envelope = createTextEnvelope(message, keyEpoch);
     const encrypted = await encryptMessage(key, roomId, envelope, message.plaintext);
     if (!isCurrent()) return false;
     Object.assign(envelope, encrypted);
@@ -1938,9 +1969,15 @@ function RoomPage({ roomId }: { roomId: string }) {
     return true;
   }
 
-  async function sendText(plaintext: string): Promise<boolean> {
-    if (sendingRef.current || !historyLoaded || room?.status !== "open") return false;
-    sendingRef.current = true;
+  function sendText(plaintext: string): Promise<boolean> {
+    // Serialize taps and outbox work: rapid likes must not be dropped by the send lock.
+    const queued = outgoingQueueRef.current.then(() => persistAndSendText(plaintext));
+    outgoingQueueRef.current = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  async function persistAndSendText(plaintext: string): Promise<boolean> {
+    if (!historyLoaded || roomStatusRef.current !== "open") return false;
     setSending(true);
     try {
       const interaction = decodeInteraction(plaintext);
@@ -1948,27 +1985,33 @@ function RoomPage({ roomId }: { roomId: string }) {
       const previous = messagesRef.current.find((message) => message.id === id);
       if (previous) return true;
       const message: HistoryMessage = {
-        id, senderSessionId: sessionId, plaintext, sentAt: Date.now(), kind: "text", delivery: "pending"
+        id, transportId: interaction ? generateMessageId() : id,
+        senderSessionId: sessionId, plaintext, sentAt: Date.now(), kind: "text", delivery: "pending"
       };
       // Persist the reply before sending: refresh/replayed requests cannot cause another answer.
       await saveHistory(roomId, sessionId, [message]);
+      messagesRef.current = upsertMessage(messagesRef.current, message);
       setMessages((current) => upsertMessage(current, message));
       try { await transmitMessage(message); }
       catch { setError("消息已保存在本机，发送失败。请重试或等待重新连接。"); }
-      jumpToLatest();
+      if (!interaction || !isStateInteraction(interaction)) jumpToLatest();
       return true;
     } catch {
       setError("本地记录保存失败，消息未发送。请检查浏览器存储权限或空间。");
       return false;
     } finally {
-      sendingRef.current = false;
       setSending(false);
     }
   }
 
-  async function flushOutbox() {
-    if (sendingRef.current || !historyLoaded || !keyReady || presence.count < 2) return;
-    sendingRef.current = true;
+  function flushOutbox() {
+    const queued = outgoingQueueRef.current.then(drainOutbox);
+    outgoingQueueRef.current = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  async function drainOutbox() {
+    if (!historyLoaded || !keyReadyRef.current || presence.count < 2) return;
     setSending(true);
     try {
       for (const message of messagesRef.current) {
@@ -1977,7 +2020,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         }
       }
     } catch { setError("发送失败，本地待发送消息已保留。请重试。"); }
-    finally { sendingRef.current = false; setSending(false); }
+    finally { setSending(false); }
   }
 
   useEffect(() => { void flushOutbox(); }, [keyReady, presence.count, historyLoaded]);
@@ -1991,6 +2034,18 @@ function RoomPage({ roomId }: { roomId: string }) {
 
   async function sendInteraction(value: Interaction) {
     return sendText(encodeInteraction(value));
+  }
+
+  function openInteraction(kind: "notice" | "poll" | "pin" | "hidden") {
+    setComposerKind(kind);
+    setShowMore(false);
+    setShowInteractions(true);
+  }
+
+  async function editMessage(start: number, end: number, replacement: string) {
+    if (!editingMessage || editingMessage.senderSessionId === sessionId ||
+        deriveInteractionState(messagesRef.current).edits.has(editingMessage.id)) return false;
+    return sendInteraction({ type: "message.edit", id: `edit:${editingMessage.id}`, replyTo: editingMessage.id, start, end, replacement });
   }
 
   function exitRoom() {
@@ -2258,6 +2313,13 @@ function RoomPage({ roomId }: { roomId: string }) {
         <button className="secondary-button" onClick={exitRoom}>退出房间</button>
       </div>
     </header>
+    {interactionState.pin && <aside className="pinned-area" aria-label="共享置顶">
+      <div className="pinned-bubble" style={{ backgroundColor: interactionState.pin.color, color: contrastColor(interactionState.pin.color) }}>
+        <span className="pin-mark" aria-hidden="true">⌁</span><p>{interactionState.pin.text}</p>
+        <button type="button" aria-label="编辑置顶" onClick={() => openInteraction("pin")} disabled={!historyLoaded}>编辑</button>
+        <button type="button" aria-label="删除置顶" onClick={() => void sendInteraction({ type: "pin.delete", id: generateMessageId() })} disabled={!historyLoaded}>×</button>
+      </div>
+    </aside>}
     {inviteLink && isCreator && <div className="invite-panel">
       <label htmlFor="invite-link">邀请链接（10 分钟内一次有效）</label>
       <input id="invite-link" readOnly value={buildInviteUrl(roomId, inviteLink.token, roomSecret)} onFocus={(event) => event.target.select()} />
@@ -2269,26 +2331,34 @@ function RoomPage({ roomId }: { roomId: string }) {
     {pendingCount > 0 && <div className="outbox-status" role="status">{pendingCount} 条消息待发送 <button onClick={() => void flushOutbox()} disabled={sending || !keyReady || presence.count < 2}>重试发送</button></div>}
     <section className="chat-log" aria-label="聊天记录" aria-live="polite" role="log" ref={chatLogRef} onScroll={handleConversationScroll}>
       <div className="chat-thread">
-        {historyLoaded && messages.length === 0 && <p className="system-line">没有消息，打个招呼吧。</p>}
-        {messages.filter((message) => message.kind === "text").map((message) => {
-          const mine = message.senderSessionId === sessionId;
-          const interaction = decodeInteraction(message.plaintext ?? "");
-          const border = interaction?.type === "notice.request" ? " notice" : interaction?.type === "poll.request" ? " poll" : interaction ? " answer" : "";
-          return <article className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${border}`} key={message.id} data-message-id={message.id}>
-            <p>{interaction ? interactionText(interaction) : message.plaintext}</p>
-            <footer>{formatClock(message.sentAt)}{mine && message.delivery === "pending" ? " · 待发送" : ""}</footer>
-          </article>;
-        })}
+        {historyLoaded && visibleMessages.length === 0 && <p className="system-line">没有消息，打个招呼吧。</p>}
+        {visibleMessages.map(message => <MessageBubble key={message.id} message={message}
+          mine={message.senderSessionId === sessionId} likes={interactionState.likes.get(message.id) ?? 0}
+          confirmed={interactionState.acknowledged.has(message.id)} answer={interactionState.answers.get(message.id)}
+          edit={interactionState.edits.get(message.id)}
+          onLike={() => sendInteraction({ type: "message.like", id: generateMessageId(), replyTo: message.id })}
+          onEdit={() => setEditingMessage(message)} />)}
       </div>
     </section>
     {awayFromLatest && <button className="jump-to-latest" onClick={jumpToLatest}>回到最新消息 {newMessageCount || ""}</button>}
+    {showMore && <div className="more-dismiss" onClick={() => setShowMore(false)} aria-hidden="true" />}
     <form className="composer" onSubmit={handleSend}>
-      <button className="secondary-button composer-plus" type="button" aria-label="更多功能" disabled={!historyLoaded || !keyReady} onClick={() => setShowInteractions(true)}>+</button>
+      <div className="composer-tools">
+        <button className={`secondary-button composer-plus${showMore ? " is-open" : ""}`} type="button" aria-label="更多功能" aria-expanded={showMore} aria-controls="chat-more-menu" disabled={!historyLoaded} onClick={() => setShowMore(!showMore)}>+</button>
+        {showMore && <div id="chat-more-menu" className="more-menu" role="menu" aria-label="聊天工具" onKeyDown={event => { if (event.key === "Escape") setShowMore(false); }}>
+          <button type="button" role="menuitem" onClick={() => openInteraction("notice")}><span aria-hidden="true">◷</span>发送提醒</button>
+          <button type="button" role="menuitem" onClick={() => openInteraction("poll")}><span aria-hidden="true">☷</span>单选调查</button>
+          <button type="button" role="menuitem" onClick={() => openInteraction("pin")}><span aria-hidden="true">⌁</span>置顶气泡</button>
+          <button type="button" role="menuitem" onClick={() => { setShowMore(false); void sendInteraction({ type: "dice", id: generateMessageId(), value: Math.floor(Math.random() * 6) + 1 }); }}><span aria-hidden="true">⚄</span>摇骰子</button>
+          <button type="button" role="menuitem" onClick={() => openInteraction("hidden")}><span aria-hidden="true">◉</span>隐藏信息</button>
+        </div>}
+      </div>
       <textarea aria-label="消息" placeholder="输入消息…" rows={1} maxLength={4000} value={draft} disabled={!historyLoaded || room?.status !== "open"} onChange={(event) => { draftRevisionRef.current += 1; setDraft(event.target.value); }} onKeyDown={handleComposerKeyDown} />
       <button className="primary-button" disabled={sending || !draft.trim() || !historyLoaded || !keyReady}>发送</button>
     </form>
     <p className="local-note">记录仅在本机 · <a href="/source.zip">源码 / AGPL-3.0</a></p>
-    {showInteractions && <InteractionComposer onSend={sendInteraction} onClose={() => setShowInteractions(false)} />}
+    {showInteractions && <InteractionComposer initialKind={composerKind} initialPin={interactionState.pin} onSend={sendInteraction} onClose={() => setShowInteractions(false)} />}
+    {editingMessage && <MessageEditDialog text={editingMessage.plaintext ?? ""} onSubmit={editMessage} onClose={() => setEditingMessage(null)} />}
     {pending[0] && <InteractionPrompt key={pending[0].id} interaction={pending[0]} onReply={sendInteraction} onExit={exitRoom} />}
   </main>;
 }

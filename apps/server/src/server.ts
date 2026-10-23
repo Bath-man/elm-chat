@@ -51,9 +51,9 @@ function duration(value: unknown, fallback: number | null): number | null {
 }
 class Socket implements RoomSocket {
   private attachment: unknown = null;
-  constructor(readonly ws: WebSocket) {}
+  constructor(readonly ws: WebSocket, private readonly canSend: () => boolean) {}
   get readyState() { return this.ws.readyState; }
-  send(data: string) { this.ws.send(data); }
+  send(data: string) { if (this.canSend() && this.ws.readyState === WebSocket.OPEN) this.ws.send(data); }
   close(code?: number, reason?: string) { this.ws.close(code, reason); }
   serializeAttachment(value: unknown) { this.attachment = structuredClone(value); }
   deserializeAttachment() { return structuredClone(this.attachment); }
@@ -65,20 +65,23 @@ type Entry = {
 
 export function createChatServer(options: {
   store: MetadataStore; publicDir: string; ownsLease?: () => boolean;
-  heartbeatMs?: number; joinTimeoutMs?: number;
+  heartbeatMs?: number; joinTimeoutMs?: number; onActivity?: () => void | Promise<void>;
 }) {
   const rooms = new Map<string, Promise<Entry>>();
   const ownsLease = options.ownsLease ?? (() => true);
-  let closing = false;
+  let closing = false, paused = false;
+  let draining: Promise<void> | undefined;
+  let closingTask: Promise<void> | undefined;
   const alive = new WeakMap<WebSocket, boolean>();
   const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024, perMessageDeflate: false });
-  const ensureReady = () => { if (closing || !ownsLease()) throw new HttpError(503, "聊天服务正在切换，请稍后重试。"); };
+  const ensureReady = () => { if (closing || paused || !ownsLease()) throw new HttpError(503, "聊天服务正在切换，请稍后重试。"); };
   const dispose = (id: string, entry: Entry) => {
     entry.disposed = true; clearTimeout(entry.timer);
     for (const socket of entry.sockets) socket.ws.terminate();
     if (rooms.has(id)) rooms.delete(id);
   };
   async function entryFor(id: string): Promise<Entry> {
+    ensureReady();
     const existing = rooms.get(id); if (existing) return existing;
     const loading = (async () => {
       let values = await options.store.load(id) ?? {};
@@ -129,8 +132,13 @@ export function createChatServer(options: {
   // Bounded per-process creation limiter. No IP addresses or message bodies are logged/stored.
   const creationTimes: number[] = [];
   async function api(req: IncomingMessage, url: URL): Promise<Response> {
+    if (!sameOrigin(req)) throw new HttpError(403, "Cross-origin request denied.");
+    await options.onActivity?.();
+    if (url.pathname === "/api/runtime" && req.method === "GET") {
+      const ready = !closing && !paused && ownsLease();
+      return json({ready}, ready ? 200 : 503);
+    }
     ensureReady();
-    if (req.method === "POST" && !sameOrigin(req)) throw new HttpError(403, "Cross-origin request denied.");
     if (url.pathname === "/api/growth" && req.method === "POST") return new Response(null,{status:204});
     if (url.pathname === "/api/rooms" && req.method === "POST") {
       const now = Date.now();
@@ -196,7 +204,7 @@ export function createChatServer(options: {
     void (async () => {
       const url = requestUrl(req);
       if (url.pathname === "/healthz") return respond(res,json({ok:true}));
-      if (url.pathname === "/readyz") return respond(res,json({ready:!closing && ownsLease()},!closing && ownsLease() ? 200 : 503));
+      if (url.pathname === "/readyz") return respond(res,json({ready:!closing && !paused && ownsLease()},!closing && !paused && ownsLease() ? 200 : 503));
       if (url.pathname.startsWith("/api/")) return respond(res,await api(req,url));
       await assets(req,url,res);
     })().catch(error => {
@@ -209,10 +217,16 @@ export function createChatServer(options: {
   server.on("upgrade",(req,socket,head) => {
     socket.on("error",()=>{});
     void (async () => {
-      ensureReady();
       if (!sameOrigin(req)) throw new HttpError(403,"Cross-origin socket denied.");
       const match = requestUrl(req).pathname.match(/^\/api\/rooms\/([A-Za-z0-9_-]{1,80})\/ws$/);
       if (!match) throw new HttpError(404,"Not found.");
+      const key = req.headers["sec-websocket-key"];
+      if (req.method !== "GET" || req.headers.upgrade?.toLowerCase() !== "websocket" ||
+        typeof key !== "string" || !/^[+/0-9A-Za-z]{22}==$/.test(key) ||
+        !["8", "13"].includes(String(req.headers["sec-websocket-version"])))
+        throw new HttpError(400,"Invalid WebSocket handshake.");
+      await options.onActivity?.();
+      ensureReady();
       const id = match[1], entry = await entryFor(id);
       await enqueue(id,entry,async () => {
         const unavailable = await entry.room.socketStatus();
@@ -225,7 +239,7 @@ export function createChatServer(options: {
           try { wss.handleUpgrade(req,socket,head,ws => {
           cleanup();
           alive.set(ws,true); ws.on("pong",()=>alive.set(ws,true));
-          const peer = new Socket(ws); entry.sockets.add(peer);
+          const peer = new Socket(ws, () => !closing && !paused && ownsLease()); entry.sockets.add(peer);
           ws.on("error",()=>{});
           const joinedDeadline = setTimeout(()=>{
             if (!(peer.deserializeAttachment() as {sessionId?:string}|null)?.sessionId) ws.close(4408,"join timeout");
@@ -236,7 +250,7 @@ export function createChatServer(options: {
           });
           ws.once("close",()=>{
             clearTimeout(joinedDeadline); entry.sockets.delete(peer);
-            if (!closing && !entry.disposed && ownsLease()) void enqueue(id,entry,()=>entry.room.webSocketClose(peer)).catch(()=>{});
+            if (!closing && !paused && !entry.disposed && ownsLease()) void enqueue(id,entry,()=>entry.room.webSocketClose(peer)).catch(()=>{});
           });
           // Queue is still held: incoming messages append after initialization.
           void entry.room.acceptSocket(peer).then(accepted, reject);
@@ -247,29 +261,58 @@ export function createChatServer(options: {
       if (!socket.destroyed) socket.end(`HTTP/1.1 ${error instanceof HttpError ? error.status : 503} Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
     });
   });
-  const heartbeat = setInterval(()=>{
-    for (const ws of wss.clients) {
-      if (!ownsLease() || closing) { ws.close(1012,"Service restarting"); continue; }
-      if (ws.readyState === WebSocket.OPEN) {
-        if (alive.get(ws) === false) { ws.terminate(); continue; }
-        alive.set(ws,false); ws.ping();
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  function startHeartbeat() {
+    if (heartbeat || closing || paused) return;
+    heartbeat = setInterval(()=>{
+      for (const ws of wss.clients) {
+        if (!ownsLease() || closing || paused) { ws.close(1012,"Service restarting"); continue; }
+        if (ws.readyState === WebSocket.OPEN) {
+          if (alive.get(ws) === false) { ws.terminate(); continue; }
+          alive.set(ws,false); ws.ping();
+        }
       }
-    }
-  },options.heartbeatMs ?? 10_000);
-  heartbeat.unref();
-  return {
-    server,
-    async close() {
-      if (closing) return; closing = true; clearInterval(heartbeat);
-      const entries = await Promise.allSettled(rooms.values());
+    },options.heartbeatMs ?? 10_000);
+    heartbeat.unref();
+  }
+  startHeartbeat();
+  function pause(): Promise<void> {
+    if (draining) return draining;
+    paused = true;
+    clearInterval(heartbeat); heartbeat = undefined;
+    for (const ws of wss.clients) ws.terminate();
+    draining = (async () => {
+      // entryFor cannot add entries once paused. Include in-flight metadata loads,
+      // then drain their queues before releasing the durable writer lease.
+      const entries = await Promise.allSettled([...rooms.values()]);
       for (const result of entries) if (result.status === "fulfilled") {
-        const entry = result.value; clearTimeout(entry.timer);
+        const entry = result.value;
+        clearTimeout(entry.timer);
         for (const peer of entry.sockets) peer.ws.terminate();
         await entry.tail;
+        entry.disposed = true;
+        clearTimeout(entry.timer);
       }
-      wss.close();
-      await new Promise<void>(resolveClose => { server.close(()=>resolveClose()); server.closeAllConnections(); });
       rooms.clear();
+    })();
+    return draining;
+  }
+  return {
+    server, pause,
+    resume() {
+      if (closing) return;
+      paused = false; draining = undefined;
+      startHeartbeat();
+    },
+    close(): Promise<void> {
+      if (closingTask) return closingTask;
+      closing = true;
+      closingTask = (async () => {
+        await pause();
+        wss.close();
+        await new Promise<void>(resolveClose => { server.close(()=>resolveClose()); server.closeAllConnections(); });
+      })();
+      return closingTask;
     }
   };
 }

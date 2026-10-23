@@ -15,8 +15,7 @@
     "dev:web": "npm run dev --workspace @elm-chat/web",
     "dev:api": "tsx watch --env-file-if-exists=.env apps/server/src/index.ts",
     "start": "node apps/server/dist/index.mjs",
-    "package": "python3 scripts/package-source.py",
-    "release:refresh": "node scripts/refresh-release.mjs"
+    "package": "python3 scripts/package-source.py"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

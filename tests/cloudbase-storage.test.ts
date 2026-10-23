@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CloudbaseMetadataStore, FileMetadataStore, MemoryMetadataStore, type CloudbaseDatabase, type CloudbaseDocument } from "../apps/server/src/storage";
 import { CloudbaseLease } from "../apps/server/src/lease";
+import { createLeaseRuntime } from "../apps/server/src/lease-runtime";
+import { createChatServer } from "../apps/server/src/server";
 
 const directories: string[] = [];
 afterEach(async () => { vi.useRealTimers(); await Promise.all(directories.splice(0).map((p) => rm(p, { recursive: true, force: true }))); });
@@ -123,61 +125,93 @@ describe("single CloudBase runtime lease", () => {
     vi.setSystemTime(32_000); await callback!(); expect(await pending).toBe(true);
     expect(fixture.records.get("chat_runtime/singleton")?.expiresAt).toBe(62_000);
   });
-  const oldRelease = "1700000000000-00000000-0000-4000-8000-000000000001";
-  const newRelease = "1700000000001-00000000-0000-4000-8000-000000000002";
-  it("requests a newer release handoff without taking live authority, drains then acquires", async () => {
+  it("hands off on routed demand even for an identical cached image, never on passive polling", async () => {
     vi.useFakeTimers(); vi.setSystemTime(1_000);
     const fixture = fakeDatabase();
-    const old = new CloudbaseLease(fixture.db, undefined, "old", 30_000, oldRelease);
-    const next = new CloudbaseLease(fixture.db, undefined, "next", 30_000, newRelease);
-    expect(await old.renew()).toBe(true);
-    expect(await next.renew()).toBe(false);
+    const old = new CloudbaseLease(fixture.db, undefined, "old");
+    const next = new CloudbaseLease(fixture.db, undefined, "next");
+    expect(await old.renew(false)).toBe(true);
+    expect(await next.renew(false)).toBe(false);
+    expect(await old.renew(false)).toBe(true);
+    expect(fixture.records.get("chat_runtime/singleton")?.handoffOwner).toBeUndefined();
+    expect(await next.renew(true)).toBe(false);
+    expect(next.isValid()).toBe(false);
     expect(fixture.records.get("chat_runtime/singleton")?.owner).toBe("old");
-    expect(await old.renew()).toBe(false); expect(old.isValid()).toBe(false);
+    expect(await old.renew(false)).toBe(false); expect(old.isValid()).toBe(false);
     await old.release();
-    expect(fixture.records.get("chat_runtime/singleton")?.handoffRelease).toBe(newRelease);
-    // A restarted old image must not win the gap between owner shutdown and standby polling.
-    const restarted = new CloudbaseLease(fixture.db, undefined, "old-restarted", 30_000, oldRelease);
-    expect(await restarted.renew()).toBe(false);
-    expect(await next.renew()).toBe(true);
-    expect(await restarted.renew()).toBe(false);
-    expect(await next.renew()).toBe(true);
-    expect(fixture.records.get("chat_runtime/singleton")?.handoffRelease).toBeUndefined();
+    expect(fixture.records.get("chat_runtime/singleton")?.handoffOwner).toBe("next");
+    const restarted = new CloudbaseLease(fixture.db, undefined, "old-restarted");
+    expect(await restarted.renew(false)).toBe(false);
+    expect(await next.renew(false)).toBe(true);
+    expect(await restarted.renew(false)).toBe(false);
+    expect(await next.renew(false)).toBe(true);
+    expect(fixture.records.get("chat_runtime/singleton")?.handoffOwner).toBeUndefined();
   });
-  it("never evicts same or newer release owners and preserves requests across competing renewal", async () => {
+  it("reserves one requester across concurrent demands without extending its deadline", async () => {
     vi.useFakeTimers(); vi.setSystemTime(1_000);
     const fixture = fakeDatabase();
-    const old = new CloudbaseLease(fixture.db, undefined, "old", 30_000, oldRelease);
-    const same = new CloudbaseLease(fixture.db, undefined, "same", 30_000, oldRelease);
-    const next = new CloudbaseLease(fixture.db, undefined, "next", 30_000, newRelease);
-    await old.renew(); expect(await same.renew()).toBe(false); expect(await old.renew()).toBe(true);
-    expect(await Promise.all([old.renew(), next.renew()])).toEqual([true, false]);
+    const old = new CloudbaseLease(fixture.db, undefined, "old");
+    const next = new CloudbaseLease(fixture.db, undefined, "next");
+    const other = new CloudbaseLease(fixture.db, undefined, "other");
+    await old.renew();
+    expect(await Promise.all([next.renew(true), other.renew(true)])).toEqual([false, false]);
     const request = structuredClone(fixture.records.get("chat_runtime/singleton"));
-    expect(await Promise.all([next.renew(), old.renew()])).toEqual([false, false]);
+    expect(request?.handoffOwner).toBe("next");
+    vi.setSystemTime(5_000);
+    expect(await Promise.all([next.renew(true), next.renew(true), old.renew(false)])).toEqual([false, false, false]);
     expect(fixture.records.get("chat_runtime/singleton")).toEqual(request);
-    await old.release(); await next.renew();
-    expect(await old.renew()).toBe(false); expect(await next.renew()).toBe(true);
+    await old.release();
+    expect(await other.renew(true)).toBe(false);
+    expect(await next.renew(false)).toBe(true);
+    expect(await old.renew(false)).toBe(false); expect(await next.renew(false)).toBe(true);
   });
-  it("recovers after expired owners and abandoned bounded handoff requests", async () => {
+  it("reserves takeover until abandonment expires, then permits passive recovery", async () => {
     vi.useFakeTimers(); vi.setSystemTime(1_000);
     const fixture = fakeDatabase();
-    const old = new CloudbaseLease(fixture.db, undefined, "old", 30_000, oldRelease);
-    const next = new CloudbaseLease(fixture.db, undefined, "next", 30_000, newRelease);
-    await next.renew(); vi.setSystemTime(31_001);
-    expect(await old.renew()).toBe(true); // Expired newer version must not prevent disaster recovery.
-    expect(await next.renew()).toBe(false); await old.release();
-    expect(await old.renew()).toBe(false);
-    vi.setSystemTime(91_002); expect(await old.renew()).toBe(true);
+    const old = new CloudbaseLease(fixture.db, undefined, "old");
+    const next = new CloudbaseLease(fixture.db, undefined, "next");
+    await old.renew(); await next.renew(true);
+    vi.setSystemTime(31_001);
+    expect(await old.renew(false)).toBe(false);
+    vi.setSystemTime(61_001);
+    expect(await old.renew(false)).toBe(true);
+    expect(await next.renew(true)).toBe(false); // An abandoned requester can make a fresh demand.
+    expect(fixture.records.get("chat_runtime/singleton")?.handoffExpiresAt).toBe(121_001);
+    await old.release(); expect(await next.renew()).toBe(true);
   });
-  it("fails closed on corrupt release and handoff metadata", async () => {
+  it("lets the designated requester acquire after an unresponsive owner expires", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(1_000);
     const fixture = fakeDatabase();
-    const lease = new CloudbaseLease(fixture.db, undefined, "next", 30_000, newRelease);
-    for (const extra of [{ release: 42 }, { release: "unknown" }, { handoffRelease: newRelease },
-      { handoffRelease: newRelease, handoffExpiresAt: NaN },
-      { release: newRelease, handoffRelease: oldRelease, handoffExpiresAt: 1 }]) {
+    const old = new CloudbaseLease(fixture.db, undefined, "old");
+    const next = new CloudbaseLease(fixture.db, undefined, "next");
+    await old.renew(); await next.renew(true);
+    vi.setSystemTime(31_001);
+    expect(await next.renew(false)).toBe(true);
+    await old.release();
+    expect(fixture.records.get("chat_runtime/singleton")?.owner).toBe("next");
+    expect(await old.renew(false)).toBe(false);
+    expect(await next.renew(false)).toBe(true);
+  });
+  it("acquires expired or empty leases and clears obsolete release-order metadata", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(100_000);
+    const fixture = fakeDatabase();
+    const lease = new CloudbaseLease(fixture.db, undefined, "next");
+    fixture.records.set("chat_runtime/singleton", { owner: "old", expiresAt: 0,
+      release: "legacy", handoffRelease: "legacy", handoffExpiresAt: 999_999 });
+    expect(await lease.renew(false)).toBe(true);
+    expect(fixture.records.get("chat_runtime/singleton")).toEqual({ owner: "next", expiresAt: 130_000 });
+  });
+  it("fails closed on corrupt owner, expiry and demand reservation metadata", async () => {
+    const fixture = fakeDatabase();
+    const lease = new CloudbaseLease(fixture.db, undefined, "next");
+    for (const extra of [{ owner: 42 }, { expiresAt: NaN }, { handoffOwner: "" },
+      { handoffOwner: "next" }, { handoffOwner: "next", handoffExpiresAt: NaN },
+      { handoffOwner: "next", handoffExpiresAt: "tomorrow" },
+      { handoffExpiresAt: 1 }]) {
       fixture.records.set("chat_runtime/singleton", { owner: "old", expiresAt: 0, ...extra });
       await expect(lease.renew()).rejects.toThrow("lease");
       await expect(lease.release()).rejects.toThrow("lease");
+      expect(lease.isValid()).toBe(false);
     }
   });
   it("invalidates local authority on renewal or release failure, and checks code errors", async () => {
@@ -185,5 +219,46 @@ describe("single CloudBase runtime lease", () => {
     await lease.renew(); fixture.fail("throw"); await expect(lease.renew()).rejects.toThrow("network"); expect(lease.isValid()).toBe(false);
     fixture.fail(undefined); await lease.renew(); fixture.fail("code");
     await expect(lease.release()).rejects.toThrow("PERMISSION_DENIED"); expect(lease.isValid()).toBe(false);
+  });
+});
+
+
+describe("two routed versions sharing one database", () => {
+  it("moves real HTTP service and metadata to the requested version without background ping-pong", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const fixture = fakeDatabase();
+    const instances: { runtime: ReturnType<typeof createLeaseRuntime>; chat: ReturnType<typeof createChatServer>; origin: string }[] = [];
+    async function instance(owner: string) {
+      const lease = new CloudbaseLease(fixture.db, "chat_runtime", owner);
+      let runtime: ReturnType<typeof createLeaseRuntime>;
+      const chat = createChatServer({
+        store: new CloudbaseMetadataStore(fixture.db, "chat_rooms", { owner, collection: "chat_runtime" }),
+        publicDir: "/nonexistent", ownsLease: () => runtime.ownsLease(), onActivity: () => runtime.demand()
+      });
+      runtime = createLeaseRuntime({ lease, pause: chat.pause, resume: chat.resume, onError: () => {} });
+      await runtime.start();
+      await new Promise<void>(resolve => chat.server.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(chat.server.address() as { port: number }).port}`;
+      const entry = { runtime, chat, origin }; instances.push(entry); return entry;
+    }
+    try {
+      const old = await instance("old");
+      const created = await fetch(`${old.origin}/api/rooms`, { method: "POST", body: "{}" });
+      expect(created.status).toBe(201); const room = await created.json();
+      const next = await instance("next"); // Cached identical image is also a distinct process owner.
+      expect((await fetch(`${next.origin}/api/runtime`)).status).toBe(503);
+      expect(fixture.records.get("chat_runtime/singleton")?.owner).toBe("old");
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect((await fetch(`${next.origin}/readyz`)).status).toBe(200);
+      expect((await fetch(`${old.origin}/readyz`)).status).toBe(503);
+      expect((await fetch(`${old.origin}/healthz`)).status).toBe(200);
+      expect((await fetch(`${next.origin}/api/rooms/${room.roomId}`)).status).toBe(200);
+      const restartedOld = await instance("old-restarted");
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(fixture.records.get("chat_runtime/singleton")?.owner).toBe("next");
+      expect(restartedOld.runtime.ownsLease()).toBe(false);
+    } finally {
+      for (const { runtime, chat } of instances.reverse()) { await runtime.stop(); await chat.close(); }
+    }
   });
 });

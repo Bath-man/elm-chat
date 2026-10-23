@@ -67,6 +67,82 @@ describe("CloudBase-compatible Node runtime", () => {
       expect(store.snapshot()).toEqual({});
     } finally {await app.close();}
   });
+  it("only user API traffic wakes the runtime, not probes, assets or foreign origins", async () => {
+    let owned = false, activity = 0;
+    const app = createChatServer({store:new MemoryMetadataStore(),publicDir:"/nonexistent",ownsLease:()=>owned,
+      onActivity:async()=>{activity++;owned=true;}});
+    await new Promise<void>(resolve=>app.server.listen(0,"127.0.0.1",resolve));
+    const origin=`http://127.0.0.1:${(app.server.address() as {port:number}).port}`;
+    try {
+      expect((await fetch(`${origin}/readyz`)).status).toBe(503);
+      await fetch(`${origin}/healthz`);await fetch(`${origin}/`);
+      expect((await fetch(`${origin}/api/runtime`,{headers:{origin:"https://other.example"}})).status).toBe(403);
+      expect(activity).toBe(0);
+      const runtime=await fetch(`${origin}/api/runtime`);
+      expect(runtime.status).toBe(200);expect(await runtime.json()).toEqual({ready:true});
+      expect(runtime.headers.get("cache-control")).toBe("no-store");
+      await create(origin);expect(activity).toBe(2);
+    } finally {await app.close();}
+  });
+  it("wakes on valid WebSocket admission but never on socket messages or rejected handshakes", async () => {
+    let owned=true,activity=0;
+    const app=createChatServer({store:new MemoryMetadataStore(),publicDir:"/nonexistent",ownsLease:()=>owned,
+      onActivity:()=>{activity++;owned=true;}});
+    await new Promise<void>(resolve=>app.server.listen(0,"127.0.0.1",resolve));
+    const origin=`http://127.0.0.1:${(app.server.address() as {port:number}).port}`;
+    try {
+      const room=await create(origin);activity=0;owned=false;
+      const url=new URL(origin);
+      for (const headers of ["Sec-WebSocket-Version: 13\r\n", "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nOrigin: https://other.example\r\n"]) {
+        await new Promise<void>((done,reject)=>{
+          const socket=connect(Number(url.port),url.hostname,()=>socket.write(`GET /api/rooms/${room.roomId}/ws HTTP/1.1\r\nHost: ${url.host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n${headers}\r\n`));
+          socket.on("data",()=>{});socket.once("close",()=>done());socket.once("error",reject);
+        });
+      }
+      expect(activity).toBe(0);
+      const creator=await join(origin,room,true);expect(creator.result.type).toBe("joined");expect(activity).toBe(1);
+      const response=event(creator.ws,"error");creator.ws.send(JSON.stringify({type:"peer_data",data:{type:"sync_request"}}));await response;
+      expect(activity).toBe(1);
+    } finally {await app.close();}
+  });
+  it("waits for metadata loading during a drain and never caches that old snapshot after resume", async () => {
+    const first=await setup();const room=await create(first.origin);
+    const original=first.store.load.bind(first.store);
+    let release!:()=>void,loaded!:()=>void;
+    const loading=new Promise<void>(resolve=>{loaded=resolve;});
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    first.store.load=async id=>{const value=await original(id);loaded();await gate;return value;};
+    const second=await setup(first.store);
+    const pending=fetch(`${second.origin}/api/rooms/${room.roomId}`);
+    await loading;
+    let drained=false;const drain=second.app.pause().then(()=>{drained=true;});
+    await new Promise(resolve=>setTimeout(resolve,10));expect(drained).toBe(false);
+    release();await drain;expect((await pending).status).toBe(503);
+    first.store.load=original;
+    const values=await original(room.roomId);(values!["room:meta"] as Record<string,unknown>).maxAgeMs=765432;
+    await first.store.save(room.roomId,values!);
+    second.app.resume();
+    expect((await (await fetch(`${second.origin}/api/rooms/${room.roomId}`)).json()).maxAgeMs).toBe(765432);
+  });
+  it("drains sockets, stays live, then reloads durable seats on resume and closes normally", async () => {
+    const {app,origin,store}=await setup();const room=await create(origin);
+    await join(origin,room,true);const guest=await join(origin,room,false);
+    const disconnected=new Promise(resolve=>guest.ws.once("close",resolve));
+    await app.pause();await disconnected;await app.pause();
+    expect((await fetch(`${origin}/healthz`)).status).toBe(200);
+    expect((await fetch(`${origin}/readyz`)).status).toBe(503);
+    const runtime=await fetch(`${origin}/api/runtime`);
+    expect(runtime.status).toBe(503);expect(await runtime.json()).toEqual({ready:false});
+    expect((await fetch(`${origin}/api/rooms/${room.roomId}`)).status).toBe(503);
+    const values=await store.load(room.roomId);
+    const meta=values!["room:meta"] as Record<string,unknown>;
+    meta.maxAgeMs=123456;await store.save(room.roomId,values!);
+    app.resume();expect((await fetch(`${origin}/readyz`)).status).toBe(200);
+    expect((await (await fetch(`${origin}/api/rooms/${room.roomId}`)).json()).maxAgeMs).toBe(123456);
+    expect((await join(origin,room,false,guest.sessionId,key,guest.inviteToken)).result.type).toBe("joined");
+    expect((await join(origin,room,false)).result.code).toBe("room_full");
+    await app.pause();await app.close();expect(app.server.listening).toBe(false);
+  });
   it("creates rooms without exposing creator capability in metadata; health works", async () => {
     const { origin } = await setup(); const room = await create(origin);
     expect(room.roomUrl).toBe(`${origin}/c/${room.roomId}`);

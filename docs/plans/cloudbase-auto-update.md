@@ -1,4 +1,6 @@
-# CloudBase 一次配置、后续自动更新
+# CloudBase 一次配置、后续自动更新（历史方案）
+
+本计划中的版本戳与回退标记已由 `cloudbase-final-optimization.md` 的流量交接方案替代，当前部署请看 `docs/cloudbase-deploy.md`。
 
 目标：保留当前聊天/加密实现和单活动实例保护，减少部署参数，改用代码仓库持续部署，避免每次上传 ZIP。
 

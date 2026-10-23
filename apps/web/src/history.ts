@@ -1,6 +1,7 @@
 /** Chat plaintext stays in this browser's IndexedDB, never in the relay database. */
 export type HistoryMessage = {
   id: string;
+  transportId?: string;
   senderSessionId: string;
   sentAt: number;
   kind: "text";
