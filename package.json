@@ -1,0 +1,33 @@
+{
+  "name": "elm-chat",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run check:message-protocol && npm run build --workspace @elm-chat/web && npm run build --workspace @elm-chat/server",
+    "check:message-protocol": "node scripts/check-message-protocol.mjs",
+    "test": "vitest run",
+    "typecheck": "npm run typecheck --workspace @elm-chat/shared && npm run typecheck --workspace @elm-chat/crypto && npm run typecheck --workspace @elm-chat/web && npm run typecheck --workspace @elm-chat/server",
+    "dev": "concurrently -k -n api,web -c blue,green \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "npm run dev --workspace @elm-chat/web",
+    "dev:api": "tsx watch --env-file-if-exists=.env apps/server/src/index.ts",
+    "start": "node apps/server/dist/index.mjs",
+    "package": "python3 scripts/package-source.py",
+    "release:refresh": "node scripts/refresh-release.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.0",
+    "concurrently": "9.2.3",
+    "esbuild": "0.25.12",
+    "typescript": "5.9.3",
+    "tsx": "^4.20.0",
+    "vitest": "4.1.11"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@elm-chat/server",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@elm-chat/shared": "*",
+    "@cloudbase/node-sdk": "3.18.7",
+    "ws": "^8.18.0"
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-server.mjs",
+    "dev": "cd ../.. && npm run dev:api",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

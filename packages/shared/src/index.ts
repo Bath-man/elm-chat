@@ -1,0 +1,359 @@
+export const ROOM_SECRET_BYTES = 32;
+export const ROOM_ID_BYTES = 16;
+export const AES_GCM_NONCE_BYTES = 12;
+export const KEY_VERSION = "v1";
+export const MESSAGE_PROTOCOL_VERSION = 3;
+export const PEER_EVENT_PROTOCOL_VERSION = 1;
+export const HKDF_INFO = `elm-chat:${KEY_VERSION}:room-key`;
+export const DEFAULT_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
+export const DEFAULT_MAX_ROOM_AGE_MS = 24 * 60 * 60 * 1000;
+export const DEFAULT_DISAPPEAR_AFTER_READ_SECONDS = 7 * 60;
+export const MAX_CONNECTIONS_PER_ROOM = 16;
+export const MAX_TRANSCRIPT_SYNC_MESSAGES = 200;
+export const MAX_FILE_BYTES = 25 * 1024 * 1024;
+// 64 KiB of plaintext per chunk. Base64 (~87 KiB) plus the JSON envelope stays
+// well under the Cloudflare Workers ~1 MiB WebSocket message limit, while
+// keeping the chunk count for a 25 MiB file in the low hundreds.
+export const FILE_CHUNK_BYTES = 64 * 1024;
+
+export type RoomStatus = "open" | "expired" | "destroyed";
+
+export const MARKETING_ACQUISITION_SOURCES = [
+  "self-destructing-chat",
+  "send-a-password-securely",
+  "send-a-file-securely",
+  "one-time-secret-chat",
+  "temporary-private-chat",
+  "journalist-source-communication",
+  "temporary-financial-handoff",
+  "security-and-limitations",
+  "press",
+  "the-internet-needs-places-that-forget",
+  "why-i-built-elm-chat",
+  "deletion-distributed-systems-contract",
+  "building-ephemeral-chat-cloudflare",
+  "durable-objects-websocket-hibernation",
+  "cloudflare-deploy-button-monorepo",
+  "single-use-invite-links"
+] as const;
+
+export const EXTERNAL_ACQUISITION_SOURCES = [
+  "awesome-cloudflare",
+  "dev-community",
+  "devopsish",
+  "freshcode",
+  "free-startup-listing",
+  "github-discussion",
+  "github-readme",
+  "hashnode",
+  "high-scalability",
+  "llms-txt",
+  "linuxlinks",
+  "linkedin",
+  "reddit-cloudflare",
+  "reddit-selfhosted",
+  "sre-weekly",
+  "zearches"
+] as const;
+
+export const ACQUISITION_SOURCES = [
+  "invite",
+  ...MARKETING_ACQUISITION_SOURCES,
+  ...EXTERNAL_ACQUISITION_SOURCES
+] as const;
+
+export type AcquisitionSource = (typeof ACQUISITION_SOURCES)[number];
+export type MarketingAcquisitionSource =
+  (typeof MARKETING_ACQUISITION_SOURCES)[number];
+export type ExternalAcquisitionSource = (typeof EXTERNAL_ACQUISITION_SOURCES)[number];
+export type NonInviteAcquisitionSource = Exclude<AcquisitionSource, "invite">;
+
+export function isAcquisitionSource(value: unknown): value is AcquisitionSource {
+  return (
+    typeof value === "string" &&
+    (ACQUISITION_SOURCES as readonly string[]).includes(value)
+  );
+}
+
+export function isMarketingAcquisitionSource(
+  value: unknown
+): value is MarketingAcquisitionSource {
+  return (
+    typeof value === "string" &&
+    (MARKETING_ACQUISITION_SOURCES as readonly string[]).includes(value)
+  );
+}
+
+export function isExternalAcquisitionSource(
+  value: unknown
+): value is ExternalAcquisitionSource {
+  return (
+    typeof value === "string" &&
+    (EXTERNAL_ACQUISITION_SOURCES as readonly string[]).includes(value)
+  );
+}
+
+export interface CreateRoomRequest {
+  disappearAfterReadSeconds?: number | null;
+  inactivityTimeoutMs?: number | null;
+  maxAgeMs?: number | null;
+  acquisitionSource?: AcquisitionSource;
+  turnstileToken?: string;
+}
+
+export interface CreateRoomResponse {
+  roomId: string;
+  roomUrl: string;
+  websocketPath: string;
+  createdAt: number;
+  expiresAt: number | null;
+  inactivityTimeoutMs: number | null;
+  maxAgeMs: number | null;
+  disappearAfterReadSeconds: number | null;
+  creatorToken: string;
+}
+
+export interface RoomMetadata {
+  roomId: string;
+  createdAt: number;
+  expiresAt: number | null;
+  inactivityTimeoutMs: number | null;
+  maxAgeMs: number | null;
+  disappearAfterReadSeconds: number | null;
+  status: RoomStatus;
+  participantCount: number;
+  creatorJoined: boolean;
+  lastActivityAt: number;
+  membershipVersion: number;
+  destroyedAt?: number;
+}
+
+export interface EncryptedMessageEnvelope {
+  protocolVersion: typeof MESSAGE_PROTOCOL_VERSION;
+  messageId: string;
+  senderSessionId: string;
+  ciphertext: string;
+  nonce: string;
+  sentAt: number;
+  expiresAfterReadSeconds: number | null;
+  keyEpoch: number;
+}
+
+export interface PeerDescriptor {
+  sessionId: string;
+  creator: boolean;
+  connectedAt: number;
+  identityKey: string;
+  agreementKey: string;
+}
+
+export interface PresenceSnapshot {
+  count: number;
+  connectedSessionIds: string[];
+}
+
+export interface JoinPayload {
+  type: "join";
+  sessionId: string;
+  identityKey: string;
+  agreementKey: string;
+  creatorToken?: string;
+  inviteToken?: string;
+}
+
+export interface AuthenticatedPeerEvent {
+  protocolVersion: typeof PEER_EVENT_PROTOCOL_VERSION;
+  roomId: string;
+  eventId: string;
+  senderSessionId: string;
+  targetSessionId: string | null;
+  sentAt: number;
+  payload: PeerDataEvent;
+  signature: string;
+}
+
+export interface PeerDataRelayPayload {
+  type: "peer_data";
+  toSessionId?: string;
+  data: AuthenticatedPeerEvent;
+}
+
+export interface DestroyPayload {
+  type: "destroy";
+  creatorToken: string;
+}
+
+export interface PingPayload {
+  type: "ping";
+}
+
+export interface KickParticipantPayload {
+  type: "kick_participant";
+  creatorToken: string;
+  targetSessionId: string;
+}
+
+export type ClientEvent =
+  | JoinPayload
+  | PeerDataRelayPayload
+  | KickParticipantPayload
+  | DestroyPayload
+  | PingPayload;
+
+export interface JoinedEvent {
+  type: "joined";
+  room: RoomMetadata;
+  sessionId: string;
+  creator: boolean;
+  self: PeerDescriptor;
+  peers: PeerDescriptor[];
+  presence: PresenceSnapshot;
+}
+
+export interface PresenceEvent {
+  type: "presence";
+  presence: PresenceSnapshot;
+}
+
+export interface PeerJoinedEvent {
+  type: "peer_joined";
+  peer: PeerDescriptor;
+  membershipVersion: number;
+}
+
+export interface PeerLeftEvent {
+  type: "peer_left";
+  sessionId: string;
+  membershipVersion: number;
+}
+
+export interface PeerDataRelayEvent {
+  type: "peer_data";
+  fromSessionId: string;
+  data: AuthenticatedPeerEvent;
+}
+
+export interface RoomStateEvent {
+  type: "room_state";
+  status: RoomStatus;
+  expiresAt: number | null;
+  reason?: string;
+}
+
+export interface ParticipantKickedEvent {
+  type: "participant_kicked";
+  sessionId: string;
+  reason?: string;
+}
+
+export interface ErrorEventPayload {
+  type: "error";
+  code: string;
+  message: string;
+}
+
+export type ServerEvent =
+  | JoinedEvent
+  | PresenceEvent
+  | PeerJoinedEvent
+  | PeerLeftEvent
+  | PeerDataRelayEvent
+  | ParticipantKickedEvent
+  | RoomStateEvent
+  | ErrorEventPayload;
+
+export interface RoomInvite {
+  token: string;
+  createdAt: number;
+  expiresAt: number;
+  claimedAt?: number;
+  claimedBySessionId?: string;
+  admittedAt?: number;
+  consumedAt?: number;
+  consumedBySessionId?: string;
+  revokedAt?: number;
+}
+
+export interface TranscriptSyncRequest {
+  type: "sync_request";
+}
+
+export interface TranscriptSyncResponse {
+  type: "sync_response";
+  messages: AuthenticatedPeerEvent[];
+  completeness: "peer-partial";
+  truncated: boolean;
+}
+
+export interface PeerChatMessage {
+  type: "chat_message";
+  envelope: EncryptedMessageEnvelope;
+}
+
+export interface PeerDestroyMessage {
+  type: "peer_destroy";
+}
+
+export interface PeerFileAnnouncement {
+  type: "file_offer";
+  fileId: string;
+  senderSessionId: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  sentAt: number;
+  expiresAfterReadSeconds: number | null;
+  sha256: string;
+  keyEpoch: number;
+}
+
+export interface PeerFileRequest {
+  type: "file_request";
+  fileId: string;
+}
+
+export interface PeerFileChunk {
+  type: "file_chunk";
+  fileId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  ciphertext: string;
+  nonce: string;
+  keyEpoch: number;
+}
+
+export interface PeerFileComplete {
+  type: "file_complete";
+  fileId: string;
+  sha256: string;
+}
+
+export interface PeerFileCancel {
+  type: "file_cancel";
+  fileId: string;
+  reason: "cancelled" | "disconnected" | "integrity" | "timeout";
+}
+
+export interface PeerKeyRotation {
+  type: "key_rotation";
+  keyEpoch: number;
+  senderAgreementKey: string;
+  ciphertext: string;
+  nonce: string;
+}
+
+export type PeerDataEvent =
+  | TranscriptSyncRequest
+  | TranscriptSyncResponse
+  | PeerChatMessage
+  | PeerDestroyMessage
+  | PeerFileAnnouncement
+  | PeerFileRequest
+  | PeerFileChunk
+  | PeerFileComplete
+  | PeerFileCancel
+  | PeerKeyRotation;
+
+export function assertNever(value: never): never {
+  throw new Error(`Unhandled value: ${String(value)}`);
+}

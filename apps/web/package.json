@@ -1,0 +1,25 @@
+{
+  "name": "@elm-chat/web",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@elm-chat/crypto": "*",
+    "@elm-chat/shared": "*",
+    "react": "19.2.5",
+    "react-dom": "19.2.5"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.3",
+    "vite": "6.4.2"
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "indexnow": "node scripts/submit-indexnow.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}
