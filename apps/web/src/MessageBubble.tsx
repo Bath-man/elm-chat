@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import { decodeInteraction, interactionText, type MessageEdit } from "./interactions";
 
-type BubbleMessage = { id: string; plaintext?: string; sentAt: number; delivery?: "pending" | "sent"; imported?: boolean };
+export type MessageEntrance = { until: number; played?: boolean };
+
+type BubbleMessage = { id: string; plaintext?: string; sentAt: number; delivery?: "pending" | "sent"; imported?: boolean; entrance?: MessageEntrance };
 
 export function MessageBubble({ message, mine, likes, confirmed, answer, edit, onLike, onEdit }: {
   message: BubbleMessage;
@@ -13,6 +15,23 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
   onLike: () => Promise<boolean>;
   onEdit: () => void;
 }) {
+  // UI-only token survives delivery updates and temporary unmounts. Consume it
+  // after commit (not during render, which StrictMode can repeat).
+  const [animateEntrance, setAnimateEntrance] = useState(() => !message.imported &&
+    !!message.entrance && !message.entrance.played && message.entrance.until > Date.now() &&
+    !window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  useEffect(() => {
+    if (message.entrance) message.entrance.played = true;
+    if (!animateEntrance) return;
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const stop = () => setAnimateEntrance(false);
+    const onMotionChange = () => { if (motion.matches) stop(); };
+    // Fallback for suppressed/cancelled animations that do not emit animationend.
+    const timeout = window.setTimeout(stop, 250);
+    motion.addEventListener("change", onMotionChange);
+    onMotionChange();
+    return () => { window.clearTimeout(timeout); motion.removeEventListener("change", onMotionChange); };
+  }, [animateEntrance, message.entrance]);
   const [revealed, setRevealed] = useState(false);
   const [actions, setActions] = useState(false);
   const [hearts, setHearts] = useState<{ id: number; style: CSSProperties }[]>([]);
@@ -53,7 +72,10 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
   const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(message.sentAt);
   const suffix = kind === "notice.request" ? ` notice${confirmed ? " confirmed" : ""}` : kind === "poll.request" ? " poll" : kind === "poll.answer" ? " answer" : kind === "dice" ? " dice" : kind === "hidden" ? " hidden-message" : "";
 
-  return <article className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${suffix}${ordinary ? " likeable" : ""}`}
+  return <article className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${suffix}${ordinary ? " likeable" : ""}${animateEntrance ? " bubble-enter" : ""}`}
+    onAnimationEnd={event => {
+      if (event.target === event.currentTarget && event.animationName === "message-enter") setAnimateEntrance(false);
+    }}
     data-message-id={message.id} role={ordinary ? "button" : undefined} tabIndex={ordinary ? 0 : undefined}
     aria-label={ordinary ? "点赞消息" : undefined}
     onPointerDown={pointerDown} onPointerUp={() => clearTimeout(hold.current)}

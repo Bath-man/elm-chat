@@ -159,6 +159,7 @@ export interface JoinPayload {
   agreementKey: string;
   creatorToken?: string;
   inviteToken?: string;
+  reconnectToken?: string;
 }
 
 export interface AuthenticatedPeerEvent {
@@ -202,6 +203,7 @@ export type ClientEvent =
 
 export interface JoinedEvent {
   type: "joined";
+  reconnectToken: string;
   room: RoomMetadata;
   sessionId: string;
   creator: boolean;

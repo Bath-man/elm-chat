@@ -1,6 +1,6 @@
 import type { KeyboardEvent } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { handleComposerKeyDown } from "../apps/web/src/composer";
+import { handleComposerKeyDown, preserveComposerFocus } from "../apps/web/src/composer";
 
 function keyEvent(overrides: Record<string, unknown> = {}) {
   const submit = vi.fn();
@@ -40,6 +40,41 @@ describe("composer keyboard submission", () => {
     const { event, submit, preventDefault } = keyEvent(overrides);
     handleComposerKeyDown(event);
     expect(submit).not.toHaveBeenCalled();
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
+});
+
+// Pointer focus changes happen before click/submit; preserve an existing typing
+// session without ever focusing a composer the user has left.
+describe("send button focus", () => {
+  function press({ active = true, button = 0, disabled = false } = {}) {
+    const textarea = {};
+    const preventDefault = vi.fn();
+    const event = {
+      button,
+      currentTarget: {
+        disabled,
+        form: { querySelector: () => textarea },
+        ownerDocument: { activeElement: active ? textarea : {} }
+      },
+      preventDefault
+    } as unknown as import("react").MouseEvent<HTMLButtonElement>;
+    return { event, preventDefault };
+  }
+
+  it("prevents the send button from stealing the active textarea focus", () => {
+    const { event, preventDefault } = press();
+    preserveComposerFocus(event);
+    expect(preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["a dismissed/unfocused composer", { active: false }],
+    ["a non-primary click", { button: 2 }],
+    ["a disabled send button", { disabled: true }]
+  ])("does not interfere with %s", (_name, options) => {
+    const { event, preventDefault } = press(options);
+    preserveComposerFocus(event);
     expect(preventDefault).not.toHaveBeenCalled();
   });
 });

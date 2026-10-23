@@ -44,7 +44,7 @@ import { startTransition, useCallback, useEffect, useMemo, useRef, useState, typ
 import { encryptedChatIssue } from "./browser-support";
 import { ThemeToggle } from "./ThemeToggle";
 import { contrastColor, InteractionComposer, InteractionPrompt, MessageEditDialog } from "./InteractionDialogs";
-import { MessageBubble } from "./MessageBubble";
+import { MessageBubble, type MessageEntrance } from "./MessageBubble";
 import { decodeInteraction, deriveInteractionState, encodeInteraction, isStateInteraction, pendingInteractions, type Interaction } from "./interactions";
 import { importHistory, loadHistory, loadHistoryContext, loadHistoryPage, saveHistory, type HistoryCursor, type HistoryMessage } from "./history";
 import { decryptHistory, encryptHistory } from "./history-archive";
@@ -54,7 +54,7 @@ import { locale, t } from "./localization";
 import { InvalidMessageEnvelopeError, receiveTextMessage } from "./message-receive";
 import { ReplayGuard } from "./replay";
 import { createTextEnvelope } from "./message-send";
-import { handleComposerKeyDown } from "./composer";
+import { handleComposerKeyDown, preserveComposerFocus } from "./composer";
 import { ReconnectScheduler } from "./reconnect";
 import { loadRoomMetadata, RoomMetadataError } from "./room-metadata";
 import { ManualInviteLink } from "./ManualInviteLink";
@@ -94,6 +94,8 @@ type UiMessage = {
   plaintext?: string;
   file?: UiFile;
   imported?: boolean;
+  // UI-only; never saved to IndexedDB or sent to a peer.
+  entrance?: MessageEntrance;
 };
 
 type IncomingFile = {
@@ -211,6 +213,12 @@ function formatBytes(bytes: number): string {
 
 const GITHUB_URL = "https://github.com/shawnbure/elm-chat";
 
+function samePresence(current: PresenceSnapshot, next: PresenceSnapshot): boolean {
+  return current.count === next.count &&
+    current.connectedSessionIds.length === next.connectedSessionIds.length &&
+    current.connectedSessionIds.every(id => next.connectedSessionIds.includes(id));
+}
+
 function formatCount(value: number): string {
   if (value < 1000) {
     return String(value);
@@ -227,6 +235,10 @@ function sessionKey(roomId: string): string {
   return `elm-chat:session:${roomId}`;
 }
 
+function reconnectTokenKey(roomId: string, sessionId: string): string {
+  return `elm-chat:reconnect:${roomId}:${sessionId}`;
+}
+
 function identityKeyPairKey(roomId: string, sessionId: string): string {
   return `elm-chat:identity:${roomId}:${sessionId}`;
 }
@@ -235,14 +247,27 @@ function replayStateKey(roomId: string, sessionId: string, kind: "message" | "ev
   return `elm-chat:replay:${kind}:${roomId}:${sessionId}`;
 }
 
-async function loadIdentityKeyPair(roomId: string, sessionId: string): Promise<{
+// StrictMode can start initialization twice before key generation finishes.
+// Both attempts must use the same keys, including the persisted copy.
+const identityLoads = new Map<string, ReturnType<typeof readIdentityKeyPair>>();
+function loadIdentityKeyPair(roomId: string, sessionId: string) {
+  const key = identityKeyPairKey(roomId, sessionId);
+  const pending = identityLoads.get(key);
+  if (pending) return pending;
+  const loading = readIdentityKeyPair(roomId, sessionId);
+  identityLoads.set(key, loading);
+  void loading.finally(() => identityLoads.delete(key)).catch(() => {});
+  return loading;
+}
+
+async function readIdentityKeyPair(roomId: string, sessionId: string): Promise<{
   privateKey: CryptoKey;
   publicKey: string;
   agreementPrivateKey: CryptoKey;
   agreementPublicKey: string;
 }> {
   const storageKey = identityKeyPairKey(roomId, sessionId);
-  const stored = safeStorageGet("session", storageKey);
+  const stored = safeStorageGet("local", storageKey) ?? safeStorageGet("session", storageKey);
   if (stored) {
     try {
       const parsed = JSON.parse(stored) as {
@@ -251,14 +276,16 @@ async function loadIdentityKeyPair(roomId: string, sessionId: string): Promise<{
         agreementPrivateKey: JsonWebKey;
         agreementPublicKey: string;
       };
-      return {
+      const identity = {
         privateKey: await importIdentityPrivateKey(parsed.privateKey),
         publicKey: parsed.publicKey,
         agreementPrivateKey: await importAgreementPrivateKey(parsed.agreementPrivateKey),
         agreementPublicKey: parsed.agreementPublicKey
       };
+      safeStorageSet("local", storageKey, stored);
+      return identity;
     } catch {
-      // Replace corrupt or legacy identity state with a fresh tab-scoped key.
+      // Corrupt local keys cannot be used to recover an admitted identity.
     }
   }
   const [pair, agreementPair] = await Promise.all([
@@ -271,7 +298,7 @@ async function loadIdentityKeyPair(roomId: string, sessionId: string): Promise<{
     agreementPrivateKey: agreementPair.privateKey,
     agreementPublicKey: await exportAgreementPublicKey(agreementPair.publicKey)
   };
-  safeStorageSet("session", storageKey, JSON.stringify({
+  safeStorageSet("local", storageKey, JSON.stringify({
     privateKey: await exportIdentityPrivateKey(pair.privateKey),
     publicKey: result.publicKey,
     agreementPrivateKey: await exportAgreementPrivateKey(agreementPair.privateKey),
@@ -696,17 +723,18 @@ function FileCard({ file, onDownload }: { file: UiFile; onDownload: () => void }
   );
 }
 
-function InviteCheckingScreen({ connection, error, onRetry, focusRef }: {
+function InviteCheckingScreen({ connection, error, onRetry, focusRef, restoring = false }: {
   connection: string;
   error: string | null;
   onRetry?: () => void;
+  restoring?: boolean;
 } & RecoveryFocusTarget) {
   return (
     <main className="room-shell room-shell-centered">
       <section className="access-screen" aria-live="polite">
         <p className="eyebrow">elm chat</p>
-        <h1 className="access-title">{t("checkingInvite")}</h1>
-        <p className="access-copy">{t("verifyingInvite")}</p>
+        <h1 className="access-title">{t(restoring ? "restoringSession" : "checkingInvite")}</h1>
+        <p className="access-copy">{t(restoring ? "restoringSessionCopy" : "verifyingInvite")}</p>
         <p ref={focusRef} tabIndex={-1}>{connection}</p>
         {error ? <p className="error-text" role="alert">{error}</p> : null}
         {onRetry ? <button className="secondary-button" onClick={onRetry} type="button">{t("retryConnection")}</button> : null}
@@ -849,6 +877,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const [canRetryConnection, setCanRetryConnection] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const retryConnectionRef = useRef<(() => void) | null>(null);
+  const stopConnectionRef = useRef<(() => void) | null>(null);
   const retryFocusTargetRef = useRef<HTMLElement | null>(null);
   const preserveRetryFocusRef = useRef(false);
   const setRetryFocusTarget = useCallback((element: HTMLElement | null) => {
@@ -884,14 +913,17 @@ function RoomPage({ roomId }: { roomId: string }) {
     unit: "minutes"
   });
   const [sessionId] = useState(() => {
-    const stored = safeStorageGet("session", sessionKey(roomId));
+    const stored = safeStorageGet("local", sessionKey(roomId)) ?? safeStorageGet("session", sessionKey(roomId));
     if (stored) {
+      safeStorageSet("local", sessionKey(roomId), stored);
       return stored;
     }
     const next = generateSessionId();
-    safeStorageSet("session", sessionKey(roomId), next);
+    safeStorageSet("local", sessionKey(roomId), next);
     return next;
   });
+  const reconnectTokenRef = useRef(safeStorageGet("local", reconnectTokenKey(roomId, sessionId)) ?? "");
+  const [restoringSession] = useState(() => Boolean(reconnectTokenRef.current));
   useEffect(() => {
     let active = true;
     Promise.all([loadHistoryPage(roomId, sessionId), loadHistoryContext(roomId, sessionId)]).then(([page, context]) => {
@@ -930,7 +962,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll, preserveHistoryPosition } =
     useConversationScroll(visibleMessages, ready, conversationFind.open || concealment.hidden);
   const messageRef = useRef(new Map<string, AuthenticatedPeerEvent>());
-  const pendingEnvelopesRef = useRef(new Map<string, AuthenticatedPeerEvent>());
+  const pendingEnvelopesRef = useRef(new Map<string, { event: AuthenticatedPeerEvent; animate: boolean }>());
   const replayGuardRef = useRef<ReplayGuard | null>(null);
   const eventReplayGuardRef = useRef<ReplayGuard | null>(null);
   if (!replayGuardRef.current) {
@@ -1049,7 +1081,7 @@ function RoomPage({ roomId }: { roomId: string }) {
     void rotateRoomKey(keyEpoch);
   }
 
-  function clearRoomSecurityState() {
+  function clearRoomSecurityState(preserveSession = false) {
     conversationFind.close();
     for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
     replayGuardRef.current?.clear();
@@ -1058,8 +1090,14 @@ function RoomPage({ roomId }: { roomId: string }) {
     pendingEnvelopesRef.current.clear();
     keyReadyRef.current = false;
     setKeyReady(false);
-    safeStorageRemove("session", identityKeyPairKey(roomId, sessionId));
-    safeStorageRemove("session", sessionKey(roomId));
+    if (!preserveSession) {
+      reconnectTokenRef.current = "";
+      safeStorageRemove("local", reconnectTokenKey(roomId, sessionId));
+      safeStorageRemove("local", identityKeyPairKey(roomId, sessionId));
+      safeStorageRemove("local", sessionKey(roomId));
+      safeStorageRemove("session", identityKeyPairKey(roomId, sessionId));
+      safeStorageRemove("session", sessionKey(roomId));
+    }
   }
 
   async function refreshInvites() {
@@ -1304,6 +1342,8 @@ function RoomPage({ roomId }: { roomId: string }) {
 
     let active = true;
     let reconnectAllowed = true;
+    let bootstrapping = false;
+    let slowRetry: ReturnType<typeof setTimeout> | null = null;
     const connectionAllowed = () => active && reconnectAllowed &&
       (roomStatusRef.current === null || roomStatusRef.current === "open");
     const reconnect = new ReconnectScheduler(
@@ -1314,13 +1354,42 @@ function RoomPage({ roomId }: { roomId: string }) {
         setConnection(t("reconnecting", { seconds: Math.ceil(delay / 1000) }));
       }
     );
+    function clearSlowRetry() {
+      if (slowRetry !== null) clearTimeout(slowRetry);
+      slowRetry = null;
+    }
+    function scheduleReconnect() {
+      if (reconnect.schedule()) return true;
+      // Keep recovery automatic after the fast retry budget, even when a server
+      // outage does not produce a browser `online` event. Manual retry stays available.
+      if (reconnect.canRetry && slowRetry === null) {
+        slowRetry = setTimeout(() => {
+          slowRetry = null;
+          reconnect.retryNow();
+        }, 30000);
+      }
+      return false;
+    }
     function stopReconnecting() {
       for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
       keyWorkGenerationRef.current += 1;
       reconnectAllowed = false;
       reconnect.cancel();
+      clearSlowRetry();
       if (active) setCanRetryConnection(false);
     }
+    stopConnectionRef.current = stopReconnecting;
+    const onOnline = () => {
+      if (!joinedRef.current && reconnect.canRetry) {
+        clearSlowRetry();
+        reconnect.retryNow();
+      }
+    };
+    const onOffline = () => {
+      if (connectionAllowed()) socketRef.current?.close();
+    };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
     retryConnectionRef.current = () => {
       if (!reconnect.canRetry) return;
       const focusTarget = retryFocusTargetRef.current;
@@ -1329,11 +1398,16 @@ function RoomPage({ roomId }: { roomId: string }) {
       setCanRetryConnection(false);
       setConnectionError(null);
       setConnection(t("connecting"));
+      clearSlowRetry();
       reconnect.retryNow();
     };
     const tick = window.setInterval(() => setNow(Date.now()), 1000);
 
     async function bootstrap() {
+      if (!connectionAllowed() || bootstrapping ||
+        (socketRef.current && socketRef.current.readyState <= WebSocket.OPEN)) return;
+      bootstrapping = true;
+      if (reconnectTokenRef.current) setConnection(t("restoringSession"));
       try {
         const [metadata, key, identity] = await Promise.all([
           loadRoomMetadata(roomId),
@@ -1354,18 +1428,26 @@ function RoomPage({ roomId }: { roomId: string }) {
         setRoom(metadata);
         if (metadata.status !== "open") {
           stopReconnecting();
+          clearRoomSecurityState();
           setReady(true);
           setConnection(t("closed"));
           setRoomNotice(roomStateMessage(metadata.status));
           return;
         }
 
+        const restoring = Boolean(reconnectTokenRef.current);
+        if (!reconnectTokenRef.current) {
+          // Save the secret before admission: losing the first `joined` frame
+          // must not strand a seat whose one-time invite was already consumed.
+          reconnectTokenRef.current = generateRoomSecret();
+          safeStorageSet("local", reconnectTokenKey(roomId, sessionId), reconnectTokenRef.current);
+        }
         const socket = new WebSocket(wsUrl(`/api/rooms/${roomId}/ws`));
         socketRef.current = socket;
 
         socket.addEventListener("open", () => {
           if (!connectionAllowed() || socketRef.current !== socket) return;
-          setConnection(t("connected"));
+          setConnection(t(restoring ? "restoringSession" : "deriving"));
           joinedRef.current = false;
           socket.send(
             JSON.stringify({
@@ -1374,7 +1456,8 @@ function RoomPage({ roomId }: { roomId: string }) {
               identityKey: identityKeyRef.current,
               agreementKey: agreementPublicKeyRef.current,
               creatorToken: creatorToken || undefined,
-              inviteToken: inviteToken || undefined
+              inviteToken: inviteToken || undefined,
+              reconnectToken: reconnectTokenRef.current || undefined
             })
           );
         });
@@ -1385,6 +1468,7 @@ function RoomPage({ roomId }: { roomId: string }) {
           joinedRef.current = false;
           keyReadyRef.current = false;
           setKeyReady(false);
+          if (!reconnectAllowed) return;
           if (isInviteGuest && closeEvent.code === 4403) {
             stopReconnecting();
             setInviteAccess((current) => {
@@ -1405,7 +1489,7 @@ function RoomPage({ roomId }: { roomId: string }) {
             setReady(true);
             return;
           }
-          if (reconnect.schedule()) return;
+          if (scheduleReconnect()) return;
           setCanRetryConnection(reconnect.canRetry);
           setConnection(roomStatusRef.current === "open" ? t("disconnected") : t("closed"));
         });
@@ -1419,14 +1503,20 @@ function RoomPage({ roomId }: { roomId: string }) {
           if (!connectionAllowed() || socketRef.current !== socket) return;
           const payload = JSON.parse(String(event.data)) as ServerEvent;
           if (payload.type === "joined") {
+            if (payload.reconnectToken) {
+              reconnectTokenRef.current = payload.reconnectToken;
+              safeStorageSet("local", reconnectTokenKey(roomId, sessionId), payload.reconnectToken);
+            }
             joinedRef.current = true;
             reconnect.reset();
+            clearSlowRetry();
             setCanRetryConnection(false);
             setConnectionError(null);
+            setError(null);
             startTransition(() => {
               setInviteAccess("granted");
               setRoom(payload.room);
-              setPresence(payload.presence);
+              setPresence(current => samePresence(current, payload.presence) ? current : payload.presence);
               setReady(true);
             });
             if (creatorToken) {
@@ -1447,7 +1537,7 @@ function RoomPage({ roomId }: { roomId: string }) {
           }
 
           if (payload.type === "presence") {
-            startTransition(() => setPresence(payload.presence));
+            startTransition(() => setPresence(current => samePresence(current, payload.presence) ? current : payload.presence));
             if (creatorToken) {
               void refreshInvites();
             }
@@ -1459,13 +1549,9 @@ function RoomPage({ roomId }: { roomId: string }) {
             peersRef.current.set(payload.peer.sessionId, payload.peer);
             beginMembershipChange(payload.membershipVersion);
             startTransition(() =>
-              setPresence((current) => ({
-                count: current.connectedSessionIds.includes(payload.peer.sessionId)
-                  ? current.count
-                  : current.count + 1,
-                connectedSessionIds: current.connectedSessionIds.includes(payload.peer.sessionId)
-                  ? current.connectedSessionIds
-                  : [...current.connectedSessionIds, payload.peer.sessionId]
+              setPresence((current) => current.connectedSessionIds.includes(payload.peer.sessionId) ? current : ({
+                count: current.count + 1,
+                connectedSessionIds: [...current.connectedSessionIds, payload.peer.sessionId]
               }))
             );
             if (creatorToken) {
@@ -1489,6 +1575,7 @@ function RoomPage({ roomId }: { roomId: string }) {
             beginMembershipChange(payload.membershipVersion);
             startTransition(() =>
               setPresence((current) => {
+                if (!current.connectedSessionIds.includes(payload.sessionId)) return current;
                 const nextIds = current.connectedSessionIds.filter((id) => id !== payload.sessionId);
                 return {
                   count: nextIds.length,
@@ -1538,12 +1625,14 @@ function RoomPage({ roomId }: { roomId: string }) {
           if (payload.type === "participant_kicked") {
             if (payload.sessionId === sessionId) {
               stopReconnecting();
-              setRemovedFromRoom(true);
+              const replaced = payload.reason === "session-replaced";
+              setRemovedFromRoom(!replaced);
               setRoomNotice(null);
-              setError(null);
+              setError(replaced ? t("sessionReplaced") : null);
               setConnection(t("closed"));
               joinedRef.current = false;
-              clearRoomSecurityState();
+              // Another tab now owns this session. Do not erase its shared credentials.
+              clearRoomSecurityState(replaced);
               socket.close();
             }
             if (creatorToken) {
@@ -1576,6 +1665,11 @@ function RoomPage({ roomId }: { roomId: string }) {
             if (payload.code === "peer_missing") {
               return;
             }
+            if (["room_full", "reconnect_required", "identity_mismatch", "invalid_join", "room_unavailable"].includes(payload.code)) {
+              stopReconnecting();
+              setReady(true);
+              setConnection(t("disconnected"));
+            }
             setError(payload.message);
           }
         });
@@ -1583,12 +1677,13 @@ function RoomPage({ roomId }: { roomId: string }) {
         if (!connectionAllowed()) return;
         if (cause instanceof RoomMetadataError && cause.kind === "missing") {
           stopReconnecting();
+          clearRoomSecurityState();
           setNotFound(true);
           setReady(true);
           return;
         }
         if (cause instanceof RoomMetadataError && cause.kind === "temporary") {
-          if (reconnect.schedule()) return;
+          if (scheduleReconnect()) return;
           setCanRetryConnection(reconnect.canRetry);
           setConnection(t("disconnected"));
           setConnectionError(t("failedJoinRoom"));
@@ -1598,6 +1693,8 @@ function RoomPage({ roomId }: { roomId: string }) {
         setConnection(t("disconnected"));
         setError(cause instanceof RoomMetadataError ? t("failedJoinRoom") :
           cause instanceof Error ? cause.message : t("failedJoinRoom"));
+      } finally {
+        bootstrapping = false;
       }
     }
 
@@ -1625,7 +1722,7 @@ function RoomPage({ roomId }: { roomId: string }) {
       }
     }
 
-    async function addEnvelope(event: AuthenticatedPeerEvent) {
+    async function addEnvelope(event: AuthenticatedPeerEvent, animate = false) {
       if (event.payload.type !== "chat_message") return;
       const envelope = event.payload.envelope;
       const messageKey = roomKeysRef.current.get(envelope.keyEpoch);
@@ -1633,7 +1730,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         // WebSocket callbacks are async: a chat event may finish verification
         // before the preceding key-rotation event finishes unwrapping its key.
         if (pendingEnvelopesRef.current.size < MAX_TRANSCRIPT_SYNC_MESSAGES) {
-          pendingEnvelopesRef.current.set(envelope.messageId, event);
+          pendingEnvelopesRef.current.set(envelope.messageId, { event, animate });
         }
         return;
       }
@@ -1653,7 +1750,10 @@ function RoomPage({ roomId }: { roomId: string }) {
         };
         await saveHistory(roomId, sessionId, [message]);
         messageRef.current.set(envelope.messageId, event);
-        startTransition(() => setMessages((current) => upsertMessage(current, message)));
+        // Transcript sync is history, not a new arrival. Keep this marker out of
+        // persisted data so refresh and history pagination never replay motion.
+        const visible = animate ? { ...message, entrance: { until: Date.now() + 250 } } : message;
+        startTransition(() => setMessages((current) => upsertMessage(current, visible)));
       } catch (cause) {
         setError(
           cause instanceof InvalidMessageEnvelopeError
@@ -1706,7 +1806,7 @@ function RoomPage({ roomId }: { roomId: string }) {
           keyReadyRef.current = true;
           setKeyReady(true);
           setConnection(t("connected"));
-          for (const pending of pendingEnvelopesRef.current.values()) await addEnvelope(pending);
+          for (const pending of pendingEnvelopesRef.current.values()) await addEnvelope(pending.event, pending.animate);
           if (shouldRequestSyncRef.current) await sendPeerData({ type: "sync_request" });
         } catch {
           if (isCurrent()) setError(t("authFailed"));
@@ -1714,7 +1814,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         return;
       }
       if (payload.type === "chat_message") {
-        await addEnvelope(event);
+        await addEnvelope(event, true);
         return;
       }
 
@@ -1856,6 +1956,9 @@ function RoomPage({ roomId }: { roomId: string }) {
       active = false;
       stopReconnecting();
       retryConnectionRef.current = null;
+      stopConnectionRef.current = null;
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
       window.clearInterval(tick);
       socketRef.current?.close();
       for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
@@ -2039,7 +2142,7 @@ function RoomPage({ roomId }: { roomId: string }) {
     } finally { setArchiveBusy(false); }
   }
 
-  async function transmitMessage(message: HistoryMessage): Promise<boolean> {
+  async function transmitMessage(message: HistoryMessage & { entrance?: MessageEntrance }): Promise<boolean> {
     if (message.imported) return false;
     const key = roomKeyRef.current;
     const leader = currentKeyLeader();
@@ -2056,7 +2159,9 @@ function RoomPage({ roomId }: { roomId: string }) {
     const sentEvent = await sendPeerData({ type: "chat_message", envelope }, undefined, isCurrent);
     if (!sentEvent) return false;
     messageRef.current.set(envelope.messageId, sentEvent);
-    const sent: HistoryMessage = { ...message, delivery: "sent" };
+    // Outbox entries can come from the UI list; do not persist its motion marker.
+    const { entrance: _entrance, ...saved } = message;
+    const sent: HistoryMessage = { ...saved, delivery: "sent" };
     await saveHistory(roomId, sessionId, [sent]);
     setMessages((current) => upsertMessage(current, sent));
     return true;
@@ -2083,8 +2188,9 @@ function RoomPage({ roomId }: { roomId: string }) {
       };
       // Persist the reply before sending: refresh/replayed requests cannot cause another answer.
       await saveHistory(roomId, sessionId, [message]);
-      messagesRef.current = upsertMessage(messagesRef.current, message);
-      setMessages((current) => upsertMessage(current, message));
+      const visible = { ...message, entrance: { until: Date.now() + 250 } };
+      messagesRef.current = upsertMessage(messagesRef.current, visible);
+      setMessages((current) => upsertMessage(current, visible));
       try { await transmitMessage(message); }
       catch { setError("消息已保存在本机，发送失败。请重试或等待重新连接。"); }
       if (!interaction || !isStateInteraction(interaction)) jumpToLatest();
@@ -2142,6 +2248,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   }
 
   function exitRoom() {
+    stopConnectionRef.current?.();
     socketRef.current?.close();
     window.location.assign("/");
   }
@@ -2389,7 +2496,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   }
 
   if (!concealment.hidden && isInviteGuest && (inviteAccess !== "granted" || !room || !ready)) {
-    return <InviteCheckingScreen connection={connection} error={connectionError ?? error}
+    return <InviteCheckingScreen connection={connection} error={connectionError ?? error} restoring={restoringSession}
       focusRef={setRetryFocusTarget}
       onRetry={canRetryConnection ? () => retryConnectionRef.current?.() : undefined} />;
   }
@@ -2399,7 +2506,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const inviteLink = invites.find((invite) => canShareInvite(invite, now));
   return <main className="room-shell">
     <header className="room-header">
-      <div><h1>匿名聊天</h1><p className="room-subtitle">{!historyLoaded ? "正在读取本地记录…" : !ready ? "正在连接…" : !keyReady ? "正在建立加密连接…" : presence.count > 1 ? "对方在线 · 端到端加密" : "等待对方上线 · 端到端加密"}</p></div>
+      <div><h1>匿名聊天</h1><p className="room-subtitle">{!historyLoaded ? "正在读取本地记录…" : !ready ? restoringSession ? t("restoringSession") : "正在连接…" : !keyReady ? connection : presence.count > 1 ? "对方在线 · 端到端加密" : "等待对方上线 · 端到端加密"}</p></div>
       <div className="room-actions">
         <ThemeToggle />
         {isCreator && <button className="secondary-button" onClick={handleShareInvite} ref={inviteTriggerRef} disabled={!ready || presence.count >= 2}>邀请</button>}
@@ -2453,7 +2560,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         </div>}
       </div>
       <textarea aria-label="消息" placeholder="输入消息…" rows={1} maxLength={4000} value={draft} disabled={!historyLoaded || room?.status !== "open"} onChange={(event) => { draftRevisionRef.current += 1; setDraft(event.target.value); }} onKeyDown={handleComposerKeyDown} />
-      <button className="primary-button" disabled={sending || !draft.trim() || !historyLoaded || !keyReady}>发送</button>
+      <button className="primary-button" onPointerDown={preserveComposerFocus} onMouseDown={preserveComposerFocus} disabled={sending || !draft.trim() || !historyLoaded || !keyReady}>发送</button>
     </form>
     {archiveFeedback && <p className="local-note" role="status">{archiveFeedback}</p>}
     {archiveMode && <div className="interaction-overlay" role="dialog" aria-modal="true" aria-labelledby="archive-title">

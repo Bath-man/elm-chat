@@ -29,6 +29,11 @@
 .chat-log { padding: 22px 20px 28px; scrollbar-width: thin; }
 .chat-thread { gap: 19px; }
 .bubble { position: relative; max-width: 83%; padding: 11px 15px 9px; border-radius: 19px; line-height: 1.65; transition: background-color .2s, border-color .2s; }
+.bubble-enter { animation: message-enter 220ms ease-out; }
+@keyframes message-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 .bubble-mine { background: #edf1ed; border-bottom-right-radius: 6px; }
 .bubble-theirs { background: #f2f3f5; border-bottom-left-radius: 6px; }
 .bubble p { white-space: pre-wrap; }

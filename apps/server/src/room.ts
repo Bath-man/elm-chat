@@ -20,13 +20,17 @@ import {
   type RoomStateEvent,
   type ServerEvent
 } from "@elm-chat/shared";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { RoomContext, RoomSocket } from "./room-runtime.js";
 import { roomExpiryReason } from "./expiry.js";
 
 type RoomStorage = RoomMetadata & {
   creatorToken: string;
-  admittedSessions?: Pick<AttachmentRecord, "sessionId" | "identityKey" | "agreementKey">[];
+  admittedSessions?: (Pick<AttachmentRecord, "sessionId" | "identityKey" | "agreementKey"> & {
+    creator?: boolean;
+    reconnectTokenHash?: string;
+    reconnectRevoked?: boolean;
+  })[];
 };
 
 // Session identity is attached to each accepted socket; an empty sessionId
@@ -168,7 +172,7 @@ export class Room {
 
   async webSocketMessage(ws: RoomSocket, message: string | ArrayBuffer): Promise<void> {
     await this.storageReady;
-    if (await this.expireIfDue()) return;
+    if (await this.expireIfDue() || ws.readyState !== 1) return;
     if (typeof message !== "string") {
       ws.send(JSON.stringify(errorEvent("binary_not_supported", "Binary payloads are not supported.")));
       return;
@@ -219,6 +223,10 @@ export class Room {
       await this.scheduleNextAlarm();
       return;
     }
+
+    // Runtime close handlers may remove the old socket before this queued
+    // callback runs. A live replacement still owns the same member presence.
+    if (this.isConnected(attachment.sessionId)) return;
 
     if (this.roomMeta?.status === "open") {
       this.roomMeta.membershipVersion += 1;
@@ -296,24 +304,9 @@ export class Room {
       return;
     }
 
-    const existingSession = this.connectedSessions().find(
-      (session) => session.sessionId === payload.sessionId
-    );
-    if (existingSession) {
-      ws.send(JSON.stringify(errorEvent(
-        existingSession.identityKey === payload.identityKey && existingSession.agreementKey === payload.agreementKey
-          ? "session_connected" : "identity_mismatch",
-        existingSession.identityKey === payload.identityKey && existingSession.agreementKey === payload.agreementKey
-          ? "This session is already connected."
-          : "The session is already bound to another identity key."
-      )));
-      ws.close(4409, "duplicate session");
-      return;
-    }
-
     // Seats belong to admitted identities, not live sockets: disconnecting must
     // not let another invitation turn this one-to-one room into a group.
-    const admittedSessions = this.roomMeta.admittedSessions ??= this.connectedSessions().map(
+    const admittedSessions: NonNullable<RoomStorage["admittedSessions"]> = this.roomMeta.admittedSessions ??= this.connectedSessions().map(
       ({ sessionId, identityKey, agreementKey }) => ({ sessionId, identityKey, agreementKey })
     );
     const admitted = admittedSessions.find((session) => session.sessionId === payload.sessionId);
@@ -330,12 +323,51 @@ export class Room {
       return;
     }
 
-    const creator = payload.creatorToken === this.roomMeta.creatorToken;
-    const admission = await this.reserveInviteForJoin(creator, payload);
+    const creatorCredential = payload.creatorToken === this.roomMeta.creatorToken;
+    const tokenHash = (token: string) => createHash("sha256")
+      .update(JSON.stringify([this.roomMeta!.roomId, payload.sessionId, token])).digest("hex");
+    const presentedHash = typeof payload.reconnectToken === "string" ? tokenHash(payload.reconnectToken) : "";
+    if (admitted && (admitted.reconnectRevoked || !(
+      admitted.reconnectTokenHash
+        ? presentedHash.length === admitted.reconnectTokenHash.length &&
+          timingSafeEqual(Buffer.from(presentedHash), Buffer.from(admitted.reconnectTokenHash))
+        : creatorCredential
+    ))) {
+      ws.send(JSON.stringify(errorEvent("reconnect_required", "Your saved session could not be verified. A valid recovery credential is required.")));
+      ws.close(4403, "reconnect required");
+      return;
+    }
+    // Recovery authenticates the original seat, independent of invite expiry.
+    const creator = admitted ? (admitted.creator ?? creatorCredential) : creatorCredential;
+    const admission: InviteAdmission = admitted
+      ? { ok: true, newlyClaimed: false }
+      : await this.reserveInviteForJoin(creator, payload);
     if (!admission.ok) {
       ws.send(JSON.stringify(errorEvent(admission.code, admission.message)));
       ws.close(4403, admission.closeReason);
       return;
+    }
+    // A first admission may save its random credential before joining, so a
+    // dropped joined acknowledgement cannot strand the already-reserved seat.
+    const proposedToken = typeof payload.reconnectToken === "string" &&
+      /^[A-Za-z0-9_-]{43}$/.test(payload.reconnectToken) ? payload.reconnectToken : undefined;
+    const reconnectToken = admitted?.reconnectTokenHash
+      ? payload.reconnectToken!
+      : proposedToken ?? randomBytes(32).toString("base64url");
+
+    // Clear the superseded attachment before closing: its late close/message
+    // callbacks must not remove the replacement or relay old session events.
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as AttachmentRecord | null;
+      if (socket !== ws && attachment?.sessionId === payload.sessionId) {
+        this.sendIfOpen(socket, JSON.stringify({
+          type: "participant_kicked",
+          sessionId: payload.sessionId,
+          reason: "session-replaced"
+        } satisfies ParticipantKickedEvent));
+        socket.serializeAttachment({ ...attachment, sessionId: "" } satisfies AttachmentRecord);
+        if (socket.readyState < 2) socket.close(4403, "session replaced");
+      }
     }
 
     const session: AttachmentRecord = {
@@ -349,8 +381,13 @@ export class Room {
       admittedSessions.push({
         sessionId: payload.sessionId,
         identityKey: payload.identityKey,
-        agreementKey: payload.agreementKey
+        agreementKey: payload.agreementKey,
+        creator,
+        reconnectTokenHash: tokenHash(reconnectToken)
       });
+    } else {
+      admitted.creator = creator;
+      admitted.reconnectTokenHash = tokenHash(reconnectToken);
     }
     ws.serializeAttachment(session satisfies AttachmentRecord);
 
@@ -379,6 +416,7 @@ export class Room {
     ws.send(
       JSON.stringify({
         type: "joined",
+        reconnectToken,
         room: this.publicMetadata(this.roomMeta),
         sessionId: payload.sessionId,
         creator,
@@ -418,9 +456,6 @@ export class Room {
     }
 
     if (invite.consumedAt) {
-      if (invite.consumedBySessionId === payload.sessionId) {
-        return { ok: true, invite, newlyClaimed: false };
-      }
       return {
         ok: false,
         code: "invite_used",
@@ -557,7 +592,7 @@ export class Room {
     invite.revokedAt = Date.now();
     this.invites.set(token, invite);
     await this.persistInvites();
-    if (invite.consumedBySessionId && this.isConnected(invite.consumedBySessionId)) {
+    if (invite.consumedBySessionId) {
       await this.disconnectSession(invite.consumedBySessionId, "invite-revoked", "invite revoked");
     }
     return jsonResponse(invite);
@@ -662,6 +697,11 @@ export class Room {
     reason: string,
     closeReason: string
   ): Promise<void> {
+    const admitted = this.roomMeta?.admittedSessions?.find(session => session.sessionId === targetSessionId);
+    if (admitted) {
+      admitted.reconnectRevoked = true;
+      delete admitted.reconnectTokenHash;
+    }
     this.broadcastToSessions([targetSessionId], {
       type: "participant_kicked",
       sessionId: targetSessionId,
