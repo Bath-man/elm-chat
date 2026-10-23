@@ -65,7 +65,9 @@
 .pin-mark { font-size: 20px; opacity: .5; }
 .pinned-bubble button { min-height: 34px; padding: 3px 7px; border: 0; background: transparent; color: inherit; font-size: 12px; flex-shrink: 0; }
 .pinned-bubble button:last-child { font-size: 20px; }
-.composer { padding: 12px 14px 5px; gap: 9px; }
+.composer { position: relative; padding: 12px 14px 5px; gap: 9px; }
+.outbox-status { position: absolute; bottom: calc(100% + 8px); left: 14px; max-width: calc(100% - 28px); z-index: 5; display: flex; align-items: center; gap: 8px; padding: 4px 12px; border: 1px solid #e7e9e7; border-radius: 14px; background: #fff; box-shadow: 0 2px 10px #0001; }
+[data-theme="dark"] .outbox-status { background: #252b28; border-color: #444; }
 .composer textarea { border-color: #e7e9e7; background: #f7f8f7; border-radius: 20px; padding: 11px 14px; line-height: 1.4; }
 .composer .primary-button { border-radius: 18px; min-height: 44px; padding: 10px 16px; }
 .composer-tools { position: relative; flex-shrink: 0; z-index: 11; }

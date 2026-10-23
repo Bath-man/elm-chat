@@ -16,11 +16,14 @@ function Fixture() {
   const [messages, setMessages] = useState([]);
   const [revision, setRevision] = useState(0);
   const [sending, setSending] = useState(false);
+  const [likes, setLikes] = useState(0);
+  const [queued, setQueued] = useState(false);
   window.fixture = {
     add: message => setMessages(current => [...current, { sentAt: Date.now(), plaintext: 'Message', ...message }]),
     update: () => setRevision(value => value + 1),
     remove: id => setMessages(current => current.filter(message => message.id !== id)),
     delayed: false,
+    queue: setQueued,
   };
   async function submit(event) {
     event.preventDefault();
@@ -32,19 +35,20 @@ function Fixture() {
       plaintext: draft, sentAt: Date.now(), mine: true, entrance: { until: Date.now() + 250 } }]);
     setDraft(''); setSending(false);
   }
-  return <>
+  return <main className="room-shell">
     <button id="outside">Outside</button>
     <section id="log" className="chat-log" style={{height: 220, flex: 'none', overflowAnchor: 'none'}}>
       <div className="chat-thread">{messages.map(message => <MessageBubble key={message.id} message={message}
-        mine={!!message.mine} likes={0} confirmed={revision > 0} onLike={async () => true} onEdit={() => {}} />)}</div>
+        mine={!!message.mine} likes={likes} confirmed={revision > 0} onLike={async () => { setLikes(count => count + 1); return true; }} onEdit={() => {}} />)}</div>
     </section>
     <form className="composer" onSubmit={submit}>
+      {queued && <div className="outbox-status" role="status">1 条消息待发送 <button type="button">重试发送</button></div>}
       <textarea aria-label="Message" value={draft} onChange={event => setDraft(event.target.value)}
         onKeyDown={composer.handleComposerKeyDown} onBlur={() => window.blurCount = (window.blurCount || 0) + 1} />
       <button id="send" className="primary-button" type="submit" disabled={sending}
         onPointerDown={composer.preserveComposerFocus} onMouseDown={composer.preserveComposerFocus}>Send</button>
     </form>
-  </>;
+  </main>;
 }
 createRoot(document.getElementById('root')).render(<React.StrictMode><Fixture /></React.StrictMode>);
 `;
@@ -94,6 +98,30 @@ try {
     await page.waitForFunction(() => window.sendCount === 7);
     assert.equal(await page.locator('#send').evaluate(element => document.activeElement === element), true, 'keyboard activation retains button focus');
     console.log('PASS ' + (mobile ? 'mobile touch' : 'desktop') + ': four consecutive sends retain focus; outside/blur stay dismissed; Enter and accessible button work');
+
+    const layout = () => page.locator('#log, .composer textarea, #send').evaluateAll(elements => elements.map(element => {
+      const rect = element.getBoundingClientRect();
+      return [rect.x, rect.y, rect.width, rect.height];
+    }));
+    const unqueued = await layout();
+    await page.evaluate(() => window.fixture.queue(true));
+    await page.locator('.outbox-status').waitFor();
+    assert.deepEqual(await layout(), unqueued, 'pending status must not change chat/composer layout');
+    await page.evaluate(() => window.fixture.queue(false));
+    await page.locator('.outbox-status').waitFor({ state: 'detached' });
+    await textarea.fill('Unsent draft');
+    await textarea.evaluate(element => { element.setSelectionRange(2, 5); window.blurCount = 0; });
+    const likeTarget = page.locator('[data-message-id="sent-7"]');
+    await activate(likeTarget);
+    await likeTarget.locator('.like-count').waitFor();
+    assert.equal(await textarea.evaluate(element => document.activeElement === element), true, 'liking must retain composer focus');
+    assert.equal(await page.evaluate(() => window.blurCount || 0), 0, 'liking must not blur and refocus the composer');
+    assert.equal(await textarea.inputValue(), 'Unsent draft');
+    assert.deepEqual(await textarea.evaluate(element => [element.selectionStart, element.selectionEnd]), [2, 5]);
+    await textarea.evaluate(element => element.blur());
+    await activate(likeTarget);
+    assert.equal(await textarea.evaluate(element => document.activeElement === element), false, 'liking must not reopen a dismissed keyboard');
+    console.log('PASS pending status stays out of flow; liking preserves focus, draft and selection without reopening a dismissed keyboard');
 
     await page.waitForTimeout(260);
     await page.evaluate(() => {

@@ -44,6 +44,8 @@ npm ci
 - `notice.request`、`notice.ack`、`poll.request`、`poll.answer` 是**原加密文字载荷内**的类型，不是明文 WebSocket 事件；中继只转发密文，不保存聊天正文。
 - IndexedDB 保存本机聊天正文和待发送消息；刷新后恢复。互动请求有唯一 ID，回答有稳定关联 ID，重复事件不会生成重复回答。
 - 历史默认显示最近约100条，上翻分批加载并保持阅读位置；收到新消息时，仅在底部自动跟随。查找仅覆盖已加载的可见消息。
+- 移动端点击发送保留输入框已有焦点，成功保存后清空未改动的草稿，可连续输入；主动失焦或关闭键盘后不会强制重新弹出。桌面 Enter 发送、Shift+Enter 换行和输入法选词保持不变。
+- 新发送和收到的气泡独立播放 220ms 淡入、上浮 6px 动画；历史加载、刷新恢复、同步及导入记录不播放，更新或短暂重挂载不重播。遵循 `prefers-reduced-motion`，不改变消息布局或滚动策略。
 - 聊天菜单支持「导出记录」「导入记录」：完整历史在浏览器本地使用密码加密为 `.achat`（AES-GCM + PBKDF2，随机盐与 IV），导出不受加载条数限制。导入保留时间、内容和类型，按消息 ID 去重；只保存到本机，不发送给对方，也不触发旧互动。密码错误或文件损坏会提示失败。
 - 支持点赞、涂改、置顶、骰子和隐藏文字。连续点赞的爱心独立播放，带小幅随机飘动与渐隐，不互相替换。
 - 对方离线时消息显示“待发送”，本机页面重连且对方上线后尝试发送。不是云端离线邮箱，也不提供已读/保证送达回执。
@@ -100,6 +102,10 @@ PLAYWRIGHT_MODULE=/tmp/elm-browser-test/node_modules/playwright/index.mjs node s
 ```
 
 测试会创建临时房间，不会连接线上服务。可用 `TEST_ORIGIN` 指向本地生产构建，`CHROMIUM_PATH` 指向现有 Chromium。
+
+专项回归脚本：`scripts/check-composer-motion-browser.mjs`（焦点、动画，无需后端）、`scripts/check-room-hooks-browser.mjs`（React Hooks）及 `scripts/check-room-recovery-browser.mjs`（真实双人聊天与重连，需先启动本地服务）。同样使用外部 Playwright；这三项脚本的浏览器路径变量为 `CHROME_PATH`，房间脚本可用 `TEST_ORIGIN=http://127.0.0.1:8080`。触控模拟不等于实体手机系统键盘验证。
+
+连续点赞回归：启动本地前端后运行 `scripts/check-message-likes-browser.mjs`，默认 `TEST_ORIGIN=http://127.0.0.1:5197`，支持 `PLAYWRIGHT_MODULE` 和 `CHROME_PATH`。该脚本模拟房间传输，无需后端，检查桌面/触控连续 301 次点赞、焦点、动画清理和刷新恢复。
 
 ## 源码与 ZIP
 

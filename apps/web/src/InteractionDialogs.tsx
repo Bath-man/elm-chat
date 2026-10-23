@@ -1,8 +1,8 @@
 import { generateMessageId } from "@elm-chat/crypto";
 import { useRef, useState, type FormEvent } from "react";
 import type { Interaction, RequestInteraction } from "./interactions";
+import { loadRecentNoticeColors, noticePresetColors as colors, rememberNoticeColor } from "./recent-notice-colors";
 
-const colors = ["#fff2a8", "#ffd1dc", "#cceaff", "#d5f5dc", "#dcd4ff", "#ffffff"];
 type ComposerKind = "notice" | "poll" | "pin" | "hidden";
 
 export function InteractionComposer({ onSend, onClose, initialKind = "notice", initialPin }: {
@@ -16,6 +16,7 @@ export function InteractionComposer({ onSend, onClose, initialKind = "notice", i
   const [hiddenText, setHiddenText] = useState("");
   const [color, setColor] = useState(initialPin?.color ?? colors[0]);
   const [options, setOptions] = useState(["", ""]);
+  const [recentColors] = useState(loadRecentNoticeColors);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const sending = useRef(false);
@@ -45,7 +46,10 @@ export function InteractionComposer({ onSend, onClose, initialKind = "notice", i
         case "pin": value = { type: "pin.set", id, text: text.trim(), color }; break;
         case "hidden": value = { type: "hidden", id, surface: text.trim(), hidden: hiddenText.trim() }; break;
       }
-      if (await onSend(value)) onClose();
+      if (await onSend(value)) {
+        if (value.type === "notice.request") rememberNoticeColor(value.color);
+        onClose();
+      }
       else setError("发送失败，请重试。");
     } catch { setError("发送失败，请重试。"); }
     finally { sending.current = false; setBusy(false); }
@@ -59,6 +63,10 @@ export function InteractionComposer({ onSend, onClose, initialKind = "notice", i
       <label>{kind === "notice" ? "提醒文字" : kind === "poll" ? "问卷问题" : kind === "pin" ? "置顶文字" : "表面文字"}<textarea maxLength={kind === "hidden" ? 4000 : 500} required disabled={busy} value={text} onChange={event => setText(event.target.value)} /></label>
       {colored && <>
         <div className="interaction-colors" aria-label="预设背景色">{colors.map(preset => <button key={preset} type="button" disabled={busy} aria-label={`选择 ${preset}`} aria-pressed={color === preset} style={{ backgroundColor: preset }} onClick={() => setColor(preset)} />)}</div>
+        {kind === "notice" && recentColors.length > 0 && <div>
+          <span>最近使用</span>
+          <div className="interaction-colors" aria-label="最近使用的提醒颜色">{recentColors.map(recent => <button key={recent} type="button" disabled={busy} aria-label={`选择最近使用的颜色 ${recent}`} title={recent} aria-pressed={color.toLowerCase() === recent} style={{ backgroundColor: recent }} onClick={() => setColor(recent)} />)}</div>
+        </div>}
         <label>自定义颜色（HEX）<input value={color} disabled={busy} maxLength={7} placeholder="#RRGGBB" onChange={event => setColor(event.target.value)} aria-invalid={!validColor} /></label>
         <div className="interaction-preview" style={{ backgroundColor: validColor ? color : "#ffffff", color: validColor ? contrastColor(color) : "#111111" }}>{text || (kind === "pin" ? "置顶预览" : "提醒预览")}</div>
       </>}

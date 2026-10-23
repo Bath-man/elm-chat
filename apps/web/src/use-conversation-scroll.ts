@@ -15,13 +15,17 @@ export function useConversationScroll(messages: readonly { id: string }[], ready
     if (log) historyAnchorRef.current = { height: log.scrollHeight, top: log.scrollTop };
   }
 
-  function jumpToLatest() {
+  function followLatest() {
     followingRef.current = true;
     pendingIdsRef.current = new Set();
-    setAwayFromLatest(false);
-    setNewMessageCount(0);
     const log = chatLogRef.current;
     if (log) log.scrollTop = log.scrollHeight;
+  }
+
+  function jumpToLatest() {
+    followLatest();
+    setAwayFromLatest(false);
+    setNewMessageCount(0);
   }
 
   function handleConversationScroll() {
@@ -40,7 +44,9 @@ export function useConversationScroll(messages: readonly { id: string }[], ready
     const log = chatLogRef.current;
     if (!log) {
       previousIdsRef.current = new Set();
-      jumpToLatest();
+      followLatest();
+      if (awayFromLatest) setAwayFromLatest(false);
+      if (newMessageCount !== 0) setNewMessageCount(0);
       return;
     }
     const ids = messages.map((message) => message.id);
@@ -57,10 +63,18 @@ export function useConversationScroll(messages: readonly { id: string }[], ready
       previousIdsRef.current, pendingIdsRef.current, ids, followingRef.current && !pauseFollowing
     );
     previousIdsRef.current = new Set(ids);
-    setNewMessageCount(pendingIdsRef.current.size);
-    if (pauseFollowing) setAwayFromLatest(!isNearLatest(log) || pendingIdsRef.current.size > 0);
+    // Likes replace the message snapshot without changing visible IDs. Avoid
+    // scheduling no-op layout updates while the serialized send queue drains:
+    // React can count those as nested updates even when the values are equal.
+    if (newMessageCount !== pendingIdsRef.current.size) setNewMessageCount(pendingIdsRef.current.size);
+    if (pauseFollowing) {
+      const away = !isNearLatest(log) || pendingIdsRef.current.size > 0;
+      if (awayFromLatest !== away) setAwayFromLatest(away);
+    }
     if (!pauseFollowing && (followingRef.current || messages.length === 0)) {
-      jumpToLatest();
+      followLatest();
+      if (awayFromLatest) setAwayFromLatest(false);
+      if (newMessageCount !== 0) setNewMessageCount(0);
     }
     // When reading earlier messages, leave scrollTop to native scroll anchoring.
     // In particular, expiration and file updates must not force a jump.

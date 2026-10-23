@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent } from "react";
 import { decodeInteraction, interactionText, type MessageEdit } from "./interactions";
 
 export type MessageEntrance = { until: number; played?: boolean };
@@ -60,8 +60,18 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
   }, [likes]);
   useEffect(() => () => clearTimeout(hold.current), []);
 
-  function pointerDown(event: PointerEvent) {
+  function preserveTypingFocus(event: MouseEvent<HTMLElement>) {
     if (event.button !== 0 || !ordinary || (event.target as HTMLElement).closest("button")) return;
+    const active = event.currentTarget.ownerDocument.activeElement;
+    // Keep the same typing/IME session; never blur then programmatically refocus.
+    if (active?.matches(".composer textarea") && event.currentTarget.closest(".room-shell")?.contains(active)) {
+      event.preventDefault();
+    }
+  }
+
+  function pointerDown(event: PointerEvent<HTMLElement>) {
+    if (event.button !== 0 || !ordinary || (event.target as HTMLElement).closest("button")) return;
+    preserveTypingFocus(event);
     clearTimeout(hold.current);
     pointer.current = { x: event.clientX, y: event.clientY, suppress: false };
     if (canEdit) hold.current = setTimeout(() => {
@@ -78,7 +88,7 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
     }}
     data-message-id={message.id} role={ordinary ? "button" : undefined} tabIndex={ordinary ? 0 : undefined}
     aria-label={ordinary ? "点赞消息" : undefined}
-    onPointerDown={pointerDown} onPointerUp={() => clearTimeout(hold.current)}
+    onPointerDown={pointerDown} onMouseDown={preserveTypingFocus} onPointerUp={() => clearTimeout(hold.current)}
     onPointerCancel={() => { clearTimeout(hold.current); pointer.current.suppress = true; }}
     onPointerMove={event => {
       if (Math.hypot(event.clientX - pointer.current.x, event.clientY - pointer.current.y) > 8) {

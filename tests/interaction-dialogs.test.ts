@@ -1,12 +1,24 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { InteractionComposer, MessageEditDialog, contrastColor } from "../apps/web/src/InteractionDialogs";
 
 const onSend = async () => true;
 const onClose = () => {};
 
+afterEach(() => vi.unstubAllGlobals());
+
 describe("interaction dialog initial views", () => {
+  it("offers recently sent custom colors in the notice editor only", () => {
+    vi.stubGlobal("sessionStorage", { getItem: () => JSON.stringify(["#123456", "#abcdef"]) });
+    const notice = renderToStaticMarkup(createElement(InteractionComposer, {onSend, onClose}));
+    expect(notice).toContain("最近使用的提醒颜色");
+    expect(notice).toContain("选择最近使用的颜色 #123456");
+    expect(notice).toContain("选择最近使用的颜色 #abcdef");
+    const pin = renderToStaticMarkup(createElement(InteractionComposer, {initialKind: "pin", onSend, onClose}));
+    expect(pin).not.toContain("最近使用的提醒颜色");
+  });
+
   it("opens a small shared pin editor with existing text and color", () => {
     const html = renderToStaticMarkup(createElement(InteractionComposer, {initialKind: "pin", initialPin: {text: "一起喝水", color: "#d5f5dc"}, onSend, onClose}));
     expect(html).toContain("置顶文字");

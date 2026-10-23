@@ -2528,7 +2528,6 @@ function RoomPage({ roomId }: { roomId: string }) {
     {canRetryConnection && <button className="secondary-button" onClick={() => retryConnectionRef.current?.()}>重新连接</button>}
     {error && <p className="error-text room-error" role="alert">{error}</p>}
     {connectionError && <p className="error-text room-error" role="alert">{connectionError}</p>}
-    {pendingCount > 0 && <div className="outbox-status" role="status">{pendingCount} 条消息待发送 <button onClick={() => void flushOutbox()} disabled={sending || !keyReady || presence.count < 2}>重试发送</button></div>}
     <section className="chat-log" aria-label="聊天记录" aria-live="polite" role="log" ref={chatLogRef} onScroll={() => {
       handleConversationScroll();
       if (chatLogRef.current && chatLogRef.current.scrollTop < 80) void loadEarlierHistory();
@@ -2547,6 +2546,7 @@ function RoomPage({ roomId }: { roomId: string }) {
     {awayFromLatest && <button className="jump-to-latest" onClick={jumpToLatest}>回到最新消息 {newMessageCount || ""}</button>}
     {showMore && <div className="more-dismiss" onClick={() => setShowMore(false)} aria-hidden="true" />}
     <form className="composer" onSubmit={handleSend}>
+      {pendingCount > 0 && <div className="outbox-status" role="status">{pendingCount} 条消息待发送 <button type="button" onClick={() => void flushOutbox()} disabled={sending || !keyReady || presence.count < 2}>重试发送</button></div>}
       <div className="composer-tools">
         <button className={`secondary-button composer-plus${showMore ? " is-open" : ""}`} type="button" aria-label="更多功能" aria-expanded={showMore} aria-controls="chat-more-menu" disabled={!historyLoaded} onClick={() => setShowMore(!showMore)}>+</button>
         {showMore && <div id="chat-more-menu" className="more-menu" role="menu" aria-label="聊天工具" onKeyDown={event => { if (event.key === "Escape") setShowMore(false); }}>
