@@ -47,14 +47,15 @@ try {
   await settle();
   const count=()=>page.locator('[data-virtual-message]').count();
   assert.ok(await count()<50,'initial window is bounded');
-  await page.evaluate(()=>{window.originalSlot=document.querySelector('[data-virtual-message]');});
+  await page.evaluate(()=>{window.originalSlots=[...document.querySelectorAll('[data-virtual-message]')];});
   await page.locator('[data-id="m0"]').click();
   assert.equal(await page.locator('[data-id="m0"]').textContent(),'m0:1');
   await page.evaluate(()=>window.fixture.go('m1500'));
   await settle();
   await page.waitForSelector('[data-id="m1500"]');
   assert.ok(await count()<50,'far window is bounded');
-  assert.ok(await page.evaluate(()=>document.querySelector('[data-virtual-message]')===window.originalSlot),'slot DOM reused');
+  assert.ok(await page.evaluate(()=>[...document.querySelectorAll('[data-virtual-message]')].some(row=>window.originalSlots.includes(row))),
+    'released slot DOM reused without requiring a retained message to move to another slot');
   assert.ok(await page.locator('[data-id="m1500"]').textContent()==='m1500:0','message state reset');
   const assertVisible=async id=>assert.ok(await page.locator(`[data-id="${id}"]`).evaluate(el=>{const r=el.getBoundingClientRect(),l=document.querySelector('.chat-log').getBoundingClientRect();return r.top>=l.top&&r.bottom<=l.bottom;}),'target fully visible');
   await assertVisible('m1500');

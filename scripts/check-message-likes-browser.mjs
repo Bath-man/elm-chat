@@ -47,7 +47,7 @@ try {
         document.querySelector('h1')?.textContent === 'Could not open this session');
       assert.equal(await page.getByText('Could not open this session', { exact: true }).count(), 0,
         'rapid likes must not reach the room error boundary');
-      assert.equal(await target.locator('.like-count').textContent(), '300');
+      assert.equal(await target.locator('..').locator('.like-count').textContent(), '300');
       await textarea.fill('Keep this draft');
       // Real touch/mouse activation still preserves the composer focus.
       if (mobile) await target.tap(); else await target.click();

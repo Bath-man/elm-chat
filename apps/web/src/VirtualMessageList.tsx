@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
-import { messageOffsets, visibleMessageRange } from "./virtual-messages";
+import { messageOffsets, messageSlots, visibleMessageRange } from "./virtual-messages";
 
 export interface VirtualMessageNavigation {
   scrollToMessage(id: string): boolean;
@@ -16,17 +16,22 @@ const GAP = 8;
 const ESTIMATED_HEIGHT = 100;
 const OVERSCAN = 600;
 
-/** Windowed, variable-height rows. Slot wrappers survive scrolling; message state does not. */
+/** Variable-height windows retain overlapping messages and recycle slots only after they leave. */
 export function VirtualMessageList<T extends { id: string }>({ messages, scrollRef, navigationRef, renderMessage }: Props<T>) {
   const rootRef = useRef<HTMLDivElement>(null);
   const heights = useRef(new Map<string, number>());
+  const committedSlots = useRef(new Map<string, number>());
   const pendingNavigation = useRef<string | null>(null);
   const [viewport, setViewport] = useState({ top: 0, height: 800 });
   const [, setMeasurementVersion] = useState(0);
   const offsets = messageOffsets(messages, heights.current, ESTIMATED_HEIGHT);
   const range = visibleMessageRange(offsets, viewport.top, viewport.height, OVERSCAN);
+  const windowMessages = messages.slice(range.start, range.end);
+  const slots = messageSlots(windowMessages, committedSlots.current);
   const latest = useRef({ messages, offsets });
   latest.current = { messages, offsets };
+
+  useLayoutEffect(() => { committedSlots.current = slots; });
 
   function listTop(log: HTMLElement, root: HTMLElement) {
     return root.getBoundingClientRect().top - log.getBoundingClientRect().top - log.clientTop + log.scrollTop;
@@ -122,8 +127,8 @@ export function VirtualMessageList<T extends { id: string }>({ messages, scrollR
   return <div ref={rootRef} className="virtual-message-list" data-range-start={range.start} data-range-end={range.end}
     style={{ display: "flex", flexDirection: "column", gap: 0, overflowAnchor: "none" }}>
     <div aria-hidden="true" style={{ height: offsets[range.start], flexShrink: 0 }} />
-    {messages.slice(range.start, range.end).map((message, slot) => <div key={slot} data-virtual-message={message.id}
-      data-message-index={range.start + slot} style={{ display: "flex", flexDirection: "column", paddingBottom: GAP, flexShrink: 0 }}>
+    {windowMessages.map((message, index) => <div key={slots.get(message.id)} data-virtual-message={message.id}
+      data-message-index={range.start + index} style={{ display: "flex", flexDirection: "column", paddingBottom: GAP, flexShrink: 0 }}>
       <Fragment key={message.id}>{renderMessage(message)}</Fragment>
     </div>)}
     <div aria-hidden="true" style={{ height: offsets[messages.length] - offsets[range.end], flexShrink: 0 }} />
