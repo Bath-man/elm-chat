@@ -1,4 +1,4 @@
-import { decodeInteraction } from "./interactions";
+import { decodeInteraction, deriveInteractionState } from "./interactions";
 
 /** Chat plaintext stays in this browser's IndexedDB, never in the relay database. */
 export type HistoryMessage = {
@@ -11,6 +11,10 @@ export type HistoryMessage = {
   expiresAt?: number;
   delivery?: "pending" | "sent";
   imported?: boolean;
+  /** Ownership relative to the browser that exported an imported archive. */
+  mine?: boolean;
+  /** Frozen like count for imported messages; imported interaction events are not replayed. */
+  likes?: number;
 };
 
 type StoredMessage = HistoryMessage & { roomId: string; sessionId: string; context?: number };
@@ -138,6 +142,9 @@ export function loadHistoryContext(roomId: string, sessionId: string): Promise<H
 
 /** Existing IDs win, including when another tab imports concurrently. Never enqueue imports. */
 export function importHistory(roomId: string, sessionId: string, messages: readonly HistoryMessage[]): Promise<number> {
+  // Older archives carry like events but no snapshots. Resolve them within the
+  // archive before pagination; never apply imported events to the live room.
+  const historicalLikes = deriveInteractionState(messages).likes;
   return withHistory("readwrite", (store) => {
     let added = 0;
     const seen = new Set<string>();
@@ -147,7 +154,8 @@ export function importHistory(roomId: string, sessionId: string, messages: reado
       const request = store.get([roomId, sessionId, message.id]);
       request.onsuccess = () => {
         if (request.result) return;
-        store.put(storedMessage(roomId, sessionId, { ...message, imported: true, delivery: "sent" }));
+        const likes = message.likes ?? historicalLikes.get(message.id);
+        store.put(storedMessage(roomId, sessionId, { ...message, ...(likes === undefined ? {} : { likes }), imported: true, delivery: "sent" }));
         added += 1;
       };
     }
@@ -160,5 +168,19 @@ export function saveHistory(roomId: string, sessionId: string, messages: readonl
   return withHistory("readwrite", (store) => {
     for (const message of messages) store.put(storedMessage(roomId, sessionId, message));
     return () => undefined;
+  });
+}
+
+/** Complete received images are insert-only: retries and malicious inner IDs cannot overwrite history. */
+export function saveReceivedImage(roomId: string, sessionId: string, message: HistoryMessage): Promise<boolean> {
+  return withHistory("readwrite", store => {
+    let added = false;
+    const request = store.get([roomId, sessionId, message.id]);
+    request.onsuccess = () => {
+      if (request.result) return;
+      store.put(storedMessage(roomId, sessionId, message));
+      added = true;
+    };
+    return () => added;
   });
 }

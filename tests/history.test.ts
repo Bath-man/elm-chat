@@ -47,7 +47,7 @@ describe("local chat history", () => {
     const storage = database();
     const reads: Record<string, any>[] = [];
     storage.get.mockImplementation(() => { const request = {}; reads.push(request); return request; });
-    const promise = importHistory("room", "session", [message, { ...message, id: "two" }, { ...message, id: "two" }]);
+    const promise = importHistory("room", "session", [message, { ...message, id: "two", mine: true, likes: 3 }, { ...message, id: "two" }]);
     storage.open();
     await Promise.resolve();
     reads[0].result = message;
@@ -58,7 +58,7 @@ describe("local chat history", () => {
     expect(await promise).toBe(1);
     expect(storage.get).toHaveBeenCalledTimes(2);
     expect(storage.put).toHaveBeenCalledOnce();
-    expect(storage.put.mock.calls[0][0]).toMatchObject({ id: "two", imported: true, delivery: "sent" });
+    expect(storage.put.mock.calls[0][0]).toMatchObject({ id: "two", imported: true, delivery: "sent", mine: true, likes: 3, context: 0 });
   });
 
   it("rejects unavailable storage instead of silently using memory", async () => {
@@ -105,4 +105,44 @@ describe("local chat history", () => {
     storage.transaction.onabort();
     await expect(promise).rejects.toThrow("quota exceeded");
   });
+});
+
+describe('assembled image persistence', () => {
+  it('inserts a complete image atomically without replacing an existing ID', async () => {
+    const { saveReceivedImage } = await import('../apps/web/src/history');
+    const storage = database();
+    const read: Record<string, any> = {};
+    storage.get.mockReturnValue(read);
+    const result = saveReceivedImage('room', 'session', message);
+    storage.open(); await Promise.resolve();
+    read.result = { ...message, plaintext: 'original' }; read.onsuccess();
+    storage.transaction.oncomplete();
+    expect(await result).toBe(false);
+    expect(storage.put).not.toHaveBeenCalled();
+  });
+  it('commits a newly assembled image before reporting success', async () => {
+    const { saveReceivedImage } = await import('../apps/web/src/history');
+    const storage = database();
+    const read: Record<string, any> = {};
+    storage.get.mockReturnValue(read);
+    const result = saveReceivedImage('room', 'session', message);
+    storage.open(); await Promise.resolve();
+    read.result = undefined; read.onsuccess();
+    storage.transaction.oncomplete();
+    expect(await result).toBe(true);
+    expect(storage.put).toHaveBeenCalledOnce();
+  });
+});
+
+it('recovers likes from legacy archive events before pagination without replaying them', async () => {
+  const storage = database();
+  const reads: Record<string, any>[] = [];
+  storage.get.mockImplementation(() => { const request = {}; reads.push(request); return request; });
+  const like: HistoryMessage = { ...message, id: 'legacy-like', senderSessionId: 'other', plaintext: 'elm-interaction:v1:{"type":"message.like","id":"legacy-like","replyTo":"one"}' };
+  const imported = importHistory('room', 'different-session', [message, like]);
+  storage.open(); await Promise.resolve();
+  for (const read of reads) { read.result = undefined; read.onsuccess(); }
+  storage.transaction.oncomplete();
+  expect(await imported).toBe(2);
+  expect(storage.put.mock.calls[0]![0]).toMatchObject({ id: 'one', imported: true, likes: 1, context: 0 });
 });

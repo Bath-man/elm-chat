@@ -113,7 +113,7 @@ try {
     await textarea.evaluate(element => { element.setSelectionRange(2, 5); window.blurCount = 0; });
     const likeTarget = page.locator('[data-message-id="sent-7"]');
     await activate(likeTarget);
-    await likeTarget.locator('.like-count').waitFor();
+    await likeTarget.locator('..').locator('.message-meta .like-count').waitFor();
     assert.equal(await textarea.evaluate(element => document.activeElement === element), true, 'liking must retain composer focus');
     assert.equal(await page.evaluate(() => window.blurCount || 0), 0, 'liking must not blur and refocus the composer');
     assert.equal(await textarea.inputValue(), 'Unsent draft');

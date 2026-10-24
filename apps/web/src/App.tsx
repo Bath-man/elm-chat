@@ -3,6 +3,7 @@ import {
   createAuthenticatedPeerEvent,
   createAgreementKeyPair,
   decryptBytes,
+  decryptMessage,
   deriveRoomKey,
   encryptBytes,
   encryptMessage,
@@ -46,14 +47,14 @@ import { ThemeToggle } from "./ThemeToggle";
 import { contrastColor, InteractionComposer, InteractionPrompt, MessageEditDialog } from "./InteractionDialogs";
 import { MessageBubble, type MessageEntrance } from "./MessageBubble";
 import { decodeInteraction, deriveInteractionState, encodeInteraction, isStateInteraction, pendingInteractions, type Interaction } from "./interactions";
-import { importHistory, loadHistory, loadHistoryContext, loadHistoryPage, saveHistory, type HistoryCursor, type HistoryMessage } from "./history";
-import { decryptHistory, encryptHistory } from "./history-archive";
+import { importHistory, loadHistory, loadHistoryContext, loadHistoryPage, saveHistory, saveReceivedImage, type HistoryCursor, type HistoryMessage } from "./history";
+import { decryptHistory, encryptHistory, validateExportPasswords } from "./history-archive";
 import { recordGrowthEvent, resolveExternalAcquisitionSource } from "./growth";
 import { MarketingPage, type MarketingSlug } from "./MarketingPage";
 import { locale, t } from "./localization";
 import { InvalidMessageEnvelopeError, receiveTextMessage } from "./message-receive";
 import { ReplayGuard } from "./replay";
-import { createTextEnvelope } from "./message-send";
+import { createMessageTransmissions } from "./message-send";
 import { handleComposerKeyDown, preserveComposerFocus } from "./composer";
 import { ReconnectScheduler } from "./reconnect";
 import { loadRoomMetadata, RoomMetadataError } from "./room-metadata";
@@ -62,6 +63,11 @@ import { canShareInvite } from "./manual-invite";
 import { useConversationScroll } from "./use-conversation-scroll";
 import { useConversationFind } from "./use-conversation-find";
 import { useConversationConcealment } from "./use-conversation-concealment";
+
+import { decodeImage, encodeImage, readChatImage, ImageMessageAssembler, IMAGE_CHUNK_PREFIX, type ChatImage } from "./image-messages";
+import { ImagePreview } from "./ImagePreview";
+import { VirtualMessageList, type VirtualMessageNavigation } from "./VirtualMessageList";
+import { transcriptBatches } from "./transcript-sync";
 
 type View = "landing" | "marketing" | "room";
 
@@ -94,6 +100,8 @@ type UiMessage = {
   plaintext?: string;
   file?: UiFile;
   imported?: boolean;
+  mine?: boolean;
+  likes?: number;
   // UI-only; never saved to IndexedDB or sent to a peer.
   entrance?: MessageEntrance;
 };
@@ -846,6 +854,12 @@ function RoomPage({ roomId }: { roomId: string }) {
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [archiveMode, setArchiveMode] = useState<"export" | "import" | null>(null);
   const [archivePassword, setArchivePassword] = useState("");
+  const [archiveConfirmation, setArchiveConfirmation] = useState("");
+  const [previewImage, setPreviewImage] = useState<ChatImage | null>(null);
+  const [imageBusy, setImageBusy] = useState(false);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const imageAssemblerRef = useRef(new ImageMessageAssembler());
+  const virtualMessagesRef = useRef<VirtualMessageNavigation | null>(null);
   const [archiveFile, setArchiveFile] = useState<File | null>(null);
   const [archiveBusy, setArchiveBusy] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
@@ -893,10 +907,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const [presence, setPresence] = useState<PresenceSnapshot>({ count: 0, connectedSessionIds: [] });
   const [now, setNow] = useState(Date.now());
   const conversationFind = useConversationFind(visibleMessages, now, (id) => {
-    const log = chatLogRef.current;
-    const article = log?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
-    if (!log || !article) return;
-    log.scrollTop += article.getBoundingClientRect().top - log.getBoundingClientRect().top - 12;
+    virtualMessagesRef.current?.scrollToMessage(id);
     handleConversationScroll();
   });
   const [roomNotice, setRoomNotice] = useState<string | null>(null);
@@ -962,7 +973,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const { chatLogRef, awayFromLatest, newMessageCount, jumpToLatest, handleConversationScroll, preserveHistoryPosition } =
     useConversationScroll(visibleMessages, ready, conversationFind.open || concealment.hidden);
   const messageRef = useRef(new Map<string, AuthenticatedPeerEvent>());
-  const pendingEnvelopesRef = useRef(new Map<string, { event: AuthenticatedPeerEvent; animate: boolean }>());
+  const pendingEnvelopesRef = useRef(new Map<string, { event: AuthenticatedPeerEvent; animate: boolean; recoverImageReplay?: boolean }>());
   const replayGuardRef = useRef<ReplayGuard | null>(null);
   const eventReplayGuardRef = useRef<ReplayGuard | null>(null);
   if (!replayGuardRef.current) {
@@ -1008,6 +1019,19 @@ function RoomPage({ roomId }: { roomId: string }) {
     socket.send(JSON.stringify({ type: "peer_data", toSessionId, data }));
     eventReplayGuardRef.current?.markLocal(data.eventId);
     return data;
+  }
+
+  async function sendTranscript(peerId: string) {
+    const transcript = [...messageRef.current.values()]
+      .sort((left, right) => left.sentAt - right.sentAt)
+      .slice(-MAX_TRANSCRIPT_SYNC_MESSAGES);
+    for (const batch of transcriptBatches(transcript)) {
+      await waitForSocketDrain();
+      await sendPeerData({
+        type: "sync_response", messages: batch, completeness: "peer-partial",
+        truncated: messageRef.current.size > MAX_TRANSCRIPT_SYNC_MESSAGES
+      }, peerId);
+    }
   }
 
   function currentKeyLeader(): PeerDescriptor | undefined {
@@ -1083,6 +1107,8 @@ function RoomPage({ roomId }: { roomId: string }) {
 
   function clearRoomSecurityState(preserveSession = false) {
     conversationFind.close();
+    setPreviewImage(null);
+    imageAssemblerRef.current.clear();
     for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
     replayGuardRef.current?.clear();
     eventReplayGuardRef.current?.clear();
@@ -1558,14 +1584,7 @@ function RoomPage({ roomId }: { roomId: string }) {
               void refreshInvites();
             }
             if (messageRef.current.size > 0) {
-              await sendPeerData({
-                type: "sync_response",
-                messages: [...messageRef.current.values()]
-                  .sort((left, right) => left.sentAt - right.sentAt)
-                  .slice(-MAX_TRANSCRIPT_SYNC_MESSAGES),
-                completeness: "peer-partial",
-                truncated: messageRef.current.size > MAX_TRANSCRIPT_SYNC_MESSAGES
-              }, payload.peer.sessionId);
+              await sendTranscript(payload.peer.sessionId);
             }
             return;
           }
@@ -1700,7 +1719,8 @@ function RoomPage({ roomId }: { roomId: string }) {
 
     async function verifyPeerEvent(
       event: AuthenticatedPeerEvent,
-      relaySenderId?: string
+      relaySenderId?: string,
+      recoverImageReplay = false
     ): Promise<boolean> {
       if (
         event.roomId !== roomId ||
@@ -1711,18 +1731,20 @@ function RoomPage({ roomId }: { roomId: string }) {
       const encodedKey = peerIdentityKeysRef.current.get(event.senderSessionId);
       if (!encodedKey) return false;
       try {
-        return await eventReplayGuardRef.current!.accept(event.eventId, null, async () => {
+        const verify = async () => {
           const key = await importIdentityPublicKey(encodedKey);
-          if (!(await verifyAuthenticatedPeerEvent(key, event))) {
-            throw new Error("Peer signature verification failed.");
-          }
-        });
+          if (!(await verifyAuthenticatedPeerEvent(key, event))) throw new Error("Peer signature verification failed.");
+        };
+        // Only sync recovery may reverify chat events; addEnvelope permits replayed
+        // content exclusively for bounded image parts, never ordinary/state messages.
+        if (recoverImageReplay && event.payload.type === "chat_message") { await verify(); return true; }
+        return await eventReplayGuardRef.current!.accept(event.eventId, null, verify);
       } catch {
         return false;
       }
     }
 
-    async function addEnvelope(event: AuthenticatedPeerEvent, animate = false) {
+    async function addEnvelope(event: AuthenticatedPeerEvent, animate = false, recoverImageReplay = false) {
       if (event.payload.type !== "chat_message") return;
       const envelope = event.payload.envelope;
       const messageKey = roomKeysRef.current.get(envelope.keyEpoch);
@@ -1730,7 +1752,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         // WebSocket callbacks are async: a chat event may finish verification
         // before the preceding key-rotation event finishes unwrapping its key.
         if (pendingEnvelopesRef.current.size < MAX_TRANSCRIPT_SYNC_MESSAGES) {
-          pendingEnvelopesRef.current.set(envelope.messageId, { event, animate });
+          pendingEnvelopesRef.current.set(envelope.messageId, { event, animate, recoverImageReplay });
         }
         return;
       }
@@ -1740,16 +1762,32 @@ function RoomPage({ roomId }: { roomId: string }) {
         const received = await receiveTextMessage(
           messageKey, roomId, envelope, replayGuardRef.current!, event.senderSessionId
         );
-        if (!received) return;
-        const { plaintext, expiresAt } = received;
+        let content = received;
+        if (!content && recoverImageReplay) {
+          // Rebuild expired in-memory assemblies from authenticated sync parts
+          // when this client still owns that epoch key. Complete images are insert-only.
+          if (envelope.senderSessionId !== event.senderSessionId) return;
+          const plaintext = await decryptMessage(messageKey, roomId, envelope);
+          if (!plaintext.startsWith(IMAGE_CHUNK_PREFIX) || envelope.expiresAfterReadSeconds !== null) return;
+          content = { plaintext };
+        }
+        if (!content) return;
+        const part = imageAssemblerRef.current.accept(content.plaintext, envelope.senderSessionId, envelope.sentAt);
+        messageRef.current.set(envelope.messageId, event);
+        if (part.type === "pending") return;
+        const plaintext = part.plaintext;
+        decodeImage(plaintext); // Reject malformed reserved image data before persistence/render.
+        const { expiresAt } = content;
         const interaction = decodeInteraction(plaintext);
         const message: HistoryMessage = {
-          id: interaction?.id ?? envelope.messageId,
+          id: part.type === "image" ? part.id : interaction?.id ?? envelope.messageId,
           senderSessionId: envelope.senderSessionId, plaintext,
           sentAt: envelope.sentAt, expiresAt, kind: "text", delivery: "sent"
         };
-        await saveHistory(roomId, sessionId, [message]);
-        messageRef.current.set(envelope.messageId, event);
+        if (part.type === "image") {
+          // Authenticated inner IDs must not replace existing local messages or imports.
+          if (!await saveReceivedImage(roomId, sessionId, message)) return;
+        } else await saveHistory(roomId, sessionId, [message]);
         // Transcript sync is history, not a new arrival. Keep this marker out of
         // persisted data so refresh and history pagination never replay motion.
         const visible = animate ? { ...message, entrance: { until: Date.now() + 250 } } : message;
@@ -1806,7 +1844,7 @@ function RoomPage({ roomId }: { roomId: string }) {
           keyReadyRef.current = true;
           setKeyReady(true);
           setConnection(t("connected"));
-          for (const pending of pendingEnvelopesRef.current.values()) await addEnvelope(pending.event, pending.animate);
+          for (const pending of pendingEnvelopesRef.current.values()) await addEnvelope(pending.event, pending.animate, pending.recoverImageReplay);
           if (shouldRequestSyncRef.current) await sendPeerData({ type: "sync_request" });
         } catch {
           if (isCurrent()) setError(t("authFailed"));
@@ -1819,15 +1857,7 @@ function RoomPage({ roomId }: { roomId: string }) {
       }
 
       if (payload.type === "sync_request") {
-        const transcript = [...messageRef.current.values()]
-          .sort((left, right) => left.sentAt - right.sentAt)
-          .slice(-MAX_TRANSCRIPT_SYNC_MESSAGES);
-        await sendPeerData({
-          type: "sync_response",
-          messages: transcript,
-          completeness: "peer-partial",
-          truncated: messageRef.current.size > MAX_TRANSCRIPT_SYNC_MESSAGES
-        }, peerId);
+        await sendTranscript(peerId);
         return;
       }
 
@@ -1845,7 +1875,7 @@ function RoomPage({ roomId }: { roomId: string }) {
               : t("syncPartial")
         );
         for (const syncedEvent of payload.messages.slice(-MAX_TRANSCRIPT_SYNC_MESSAGES)) {
-          if (await verifyPeerEvent(syncedEvent)) await addEnvelope(syncedEvent);
+          if (await verifyPeerEvent(syncedEvent, undefined, true)) await addEnvelope(syncedEvent, false, true);
         }
         return;
       }
@@ -2098,6 +2128,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   function openArchive(mode: "export" | "import") {
     setShowMore(false);
     setArchivePassword("");
+    setArchiveConfirmation("");
     setArchiveFile(null);
     setArchiveError(null);
     setArchiveFeedback(null);
@@ -2110,7 +2141,8 @@ function RoomPage({ roomId }: { roomId: string }) {
     setArchiveError(null);
     try {
       if (archiveMode === "export") {
-        const content = await encryptHistory(await loadHistory(roomId, sessionId), archivePassword);
+        validateExportPasswords(archivePassword, archiveConfirmation);
+        const content = await encryptHistory(await loadHistory(roomId, sessionId), archivePassword, sessionId);
         const url = URL.createObjectURL(new Blob([content], { type: "application/octet-stream" }));
         const link = document.createElement("a");
         link.href = url;
@@ -2136,6 +2168,7 @@ function RoomPage({ roomId }: { roomId: string }) {
       }
       setArchiveMode(null);
       setArchivePassword("");
+      setArchiveConfirmation("");
       setArchiveFile(null);
     } catch (cause) {
       setArchiveError(cause instanceof Error ? cause.message : "记录处理失败，请重试。");
@@ -2151,14 +2184,16 @@ function RoomPage({ roomId }: { roomId: string }) {
     const keyWorkIsCurrent = captureKeyWork(keyEpoch, leader);
     const isCurrent = () => keyWorkIsCurrent() && roomKeyRef.current === key;
     if (!isCurrent()) return false;
-    const envelope = createTextEnvelope(message, keyEpoch);
-    const encrypted = await encryptMessage(key, roomId, envelope, message.plaintext);
-    if (!isCurrent()) return false;
-    Object.assign(envelope, encrypted);
-    replayGuardRef.current!.markLocal(envelope.messageId, null);
-    const sentEvent = await sendPeerData({ type: "chat_message", envelope }, undefined, isCurrent);
-    if (!sentEvent) return false;
-    messageRef.current.set(envelope.messageId, sentEvent);
+    for (const { envelope, plaintext } of createMessageTransmissions(message, keyEpoch)) {
+      await waitForSocketDrain();
+      if (!isCurrent()) return false;
+      Object.assign(envelope, await encryptMessage(key, roomId, envelope, plaintext));
+      if (!isCurrent()) return false;
+      replayGuardRef.current!.markLocal(envelope.messageId, null);
+      const sentEvent = await sendPeerData({ type: "chat_message", envelope }, undefined, isCurrent);
+      if (!sentEvent) return false;
+      messageRef.current.set(envelope.messageId, sentEvent);
+    }
     // Outbox entries can come from the UI list; do not persist its motion marker.
     const { entrance: _entrance, ...saved } = message;
     const sent: HistoryMessage = { ...saved, delivery: "sent" };
@@ -2229,6 +2264,19 @@ function RoomPage({ roomId }: { roomId: string }) {
     const text = draft.trim();
     const revision = draftRevisionRef.current;
     if (text && await sendText(text) && revision === draftRevisionRef.current) setDraft("");
+  }
+
+  async function handleSendImages(files: FileList | null) {
+    if (!files || imageBusy) return;
+    setImageBusy(true);
+    setShowMore(false);
+    try {
+      for (const file of Array.from(files)) {
+        const plaintext = encodeImage(await readChatImage(file));
+        if (!await sendText(plaintext)) break;
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "图片发送失败，请重试。"); }
+    finally { setImageBusy(false); if (imageInputRef.current) imageInputRef.current.value = ""; }
   }
 
   async function sendInteraction(value: Interaction) {
@@ -2535,28 +2583,36 @@ function RoomPage({ roomId }: { roomId: string }) {
       <div className="chat-thread">
         {hasMoreHistory && <button type="button" className="secondary-button" disabled={loadingHistory} onClick={() => void loadEarlierHistory()}>{loadingHistory ? "正在加载…" : "加载更早记录"}</button>}
         {historyLoaded && visibleMessages.length === 0 && <p className="system-line">没有消息，打个招呼吧。</p>}
-        {visibleMessages.map(message => <MessageBubble key={message.id} message={message}
-          mine={message.senderSessionId === sessionId} likes={interactionState.likes.get(message.id) ?? 0}
+        <VirtualMessageList messages={visibleMessages} scrollRef={chatLogRef} navigationRef={virtualMessagesRef} renderMessage={message => <MessageBubble key={message.id} message={message}
+          mine={message.imported && message.mine !== undefined ? message.mine : message.senderSessionId === sessionId} likes={message.imported ? message.likes ?? 0 : interactionState.likes.get(message.id) ?? 0}
           confirmed={interactionState.acknowledged.has(message.id)} answer={interactionState.answers.get(message.id)}
           edit={interactionState.edits.get(message.id)}
           onLike={() => sendInteraction({ type: "message.like", id: generateMessageId(), replyTo: message.id })}
-          onEdit={() => setEditingMessage(message)} />)}
+          onEdit={() => setEditingMessage(message)} onPreviewImage={setPreviewImage} />} />
       </div>
     </section>
     {awayFromLatest && <button className="jump-to-latest" onClick={jumpToLatest}>回到最新消息 {newMessageCount || ""}</button>}
     {showMore && <div className="more-dismiss" onClick={() => setShowMore(false)} aria-hidden="true" />}
+    <input className="sr-only" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple ref={imageInputRef} tabIndex={-1} aria-label="选择要发送的图片" disabled={imageBusy || !historyLoaded || room?.status !== "open"} onChange={event => void handleSendImages(event.target.files)} />
     <form className="composer" onSubmit={handleSend}>
       {pendingCount > 0 && <div className="outbox-status" role="status">{pendingCount} 条消息待发送 <button type="button" onClick={() => void flushOutbox()} disabled={sending || !keyReady || presence.count < 2}>重试发送</button></div>}
       <div className="composer-tools">
         <button className={`secondary-button composer-plus${showMore ? " is-open" : ""}`} type="button" aria-label="更多功能" aria-expanded={showMore} aria-controls="chat-more-menu" disabled={!historyLoaded} onClick={() => setShowMore(!showMore)}>+</button>
         {showMore && <div id="chat-more-menu" className="more-menu" role="menu" aria-label="聊天工具" onKeyDown={event => { if (event.key === "Escape") setShowMore(false); }}>
-          <button type="button" role="menuitem" onClick={() => openArchive("export")}><span aria-hidden="true">↓</span>导出记录</button>
-          <button type="button" role="menuitem" onClick={() => openArchive("import")}><span aria-hidden="true">↑</span>导入记录</button>
-          <button type="button" role="menuitem" onClick={() => openInteraction("notice")}><span aria-hidden="true">◷</span>发送提醒</button>
-          <button type="button" role="menuitem" onClick={() => openInteraction("poll")}><span aria-hidden="true">☷</span>单选调查</button>
-          <button type="button" role="menuitem" onClick={() => openInteraction("pin")}><span aria-hidden="true">⌁</span>置顶气泡</button>
-          <button type="button" role="menuitem" onClick={() => { setShowMore(false); void sendInteraction({ type: "dice", id: generateMessageId(), value: Math.floor(Math.random() * 6) + 1 }); }}><span aria-hidden="true">⚄</span>摇骰子</button>
-          <button type="button" role="menuitem" onClick={() => openInteraction("hidden")}><span aria-hidden="true">◉</span>隐藏信息</button>
+          <div className="more-menu-group" role="group" aria-label="消息互动">
+            <button type="button" role="menuitem" onClick={() => { setShowMore(false); void sendInteraction({ type: "dice", id: generateMessageId(), value: Math.floor(Math.random() * 6) + 1 }); }}><span aria-hidden="true">⚄</span>摇骰子</button>
+            <button type="button" role="menuitem" disabled={imageBusy || !keyReady || room?.status !== "open"} onClick={() => { setShowMore(false); imageInputRef.current?.click(); }}><span aria-hidden="true">▧</span>{imageBusy ? "正在处理图片…" : "发送图片"}</button>
+          </div>
+          <div className="more-menu-group" role="group" aria-label="更多工具">
+            <button type="button" role="menuitem" onClick={() => openInteraction("notice")}><span aria-hidden="true">◷</span>发送提醒</button>
+            <button type="button" role="menuitem" onClick={() => openInteraction("poll")}><span aria-hidden="true">☷</span>单选调查</button>
+            <button type="button" role="menuitem" onClick={() => openInteraction("pin")}><span aria-hidden="true">⌁</span>置顶气泡</button>
+            <button type="button" role="menuitem" onClick={() => openInteraction("hidden")}><span aria-hidden="true">◉</span>隐藏信息</button>
+          </div>
+          <div className="more-menu-group" role="group" aria-label="记录备份">
+            <button type="button" role="menuitem" onClick={() => openArchive("import")}><span aria-hidden="true">↑</span>导入记录</button>
+            <button type="button" role="menuitem" onClick={() => openArchive("export")}><span aria-hidden="true">↓</span>导出记录</button>
+          </div>
         </div>}
       </div>
       <textarea aria-label="消息" placeholder="输入消息…" rows={1} maxLength={4000} value={draft} disabled={!historyLoaded || room?.status !== "open"} onChange={(event) => { draftRevisionRef.current += 1; setDraft(event.target.value); }} onKeyDown={handleComposerKeyDown} />
@@ -2569,12 +2625,14 @@ function RoomPage({ roomId }: { roomId: string }) {
         <p>记录仅在本机加密和解密。请妥善保存密码，丢失后无法恢复。</p>
         {archiveMode === "import" && <label>记录文件<input type="file" accept=".achat" required disabled={archiveBusy} onChange={event => setArchiveFile(event.target.files?.[0] ?? null)} /></label>}
         <label>{archiveMode === "export" ? "设置密码" : "输入密码"}<input type="password" autoFocus required autoComplete={archiveMode === "export" ? "new-password" : "off"} value={archivePassword} disabled={archiveBusy} onChange={event => setArchivePassword(event.target.value)} /></label>
+        {archiveMode === "export" && <label>再次输入密码<input type="password" required autoComplete="new-password" value={archiveConfirmation} disabled={archiveBusy} onChange={event => setArchiveConfirmation(event.target.value)} /></label>}
         {archiveError && <p className="error-text" role="alert">{archiveError}</p>}
         <button className="primary-button" disabled={archiveBusy}>{archiveBusy ? "正在处理…" : archiveMode === "export" ? "加密并导出" : "解密并导入"}</button>
-        <button type="button" disabled={archiveBusy} onClick={() => { setArchiveMode(null); setArchivePassword(""); setArchiveFile(null); }}>取消</button>
+        <button type="button" disabled={archiveBusy} onClick={() => { setArchiveMode(null); setArchivePassword(""); setArchiveConfirmation(""); setArchiveFile(null); }}>取消</button>
       </form>
     </div>}
     <p className="local-note">记录仅在本机 · <a href="/source.zip">源码 / AGPL-3.0</a></p>
+    {previewImage && <ImagePreview image={previewImage} onClose={() => setPreviewImage(null)} />}
     {showInteractions && <InteractionComposer initialKind={composerKind} initialPin={interactionState.pin} onSend={sendInteraction} onClose={() => setShowInteractions(false)} />}
     {editingMessage && <MessageEditDialog text={editingMessage.plaintext ?? ""} onSubmit={editMessage} onClose={() => setEditingMessage(null)} />}
     {pending[0] && <InteractionPrompt key={pending[0].id} interaction={pending[0]} onReply={sendInteraction} onExit={exitRoom} />}

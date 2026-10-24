@@ -1,4 +1,6 @@
 import type { HistoryMessage } from "./history";
+import { deriveInteractionState } from "./interactions";
+import { decodeImage } from "./image-messages";
 
 const ITERATIONS = 210_000;
 const INVALID_ARCHIVE = "密码错误或记录文件已损坏";
@@ -19,9 +21,13 @@ function messagesFrom(value: unknown): HistoryMessage[] {
       message.kind !== "text" || typeof message.plaintext !== "string" ||
       (message.transportId !== undefined && typeof message.transportId !== "string") ||
       (message.expiresAt !== undefined && (typeof message.expiresAt !== "number" || !Number.isFinite(message.expiresAt))) ||
-      (message.imported !== undefined && typeof message.imported !== "boolean")) {
+      (message.imported !== undefined && typeof message.imported !== "boolean") ||
+      (message.mine !== undefined && typeof message.mine !== "boolean") ||
+      (message.likes !== undefined && (typeof message.likes !== "number" || !Number.isSafeInteger(message.likes) || message.likes < 0))) {
       throw new Error(INVALID_ARCHIVE);
     }
+    // Reserved image payloads must satisfy the same validation as live messages.
+    decodeImage(message.plaintext);
     return {
       id: message.id,
       senderSessionId: message.senderSessionId,
@@ -30,7 +36,9 @@ function messagesFrom(value: unknown): HistoryMessage[] {
       plaintext: message.plaintext,
       ...(message.transportId === undefined ? {} : { transportId: message.transportId }),
       ...(message.expiresAt === undefined ? {} : { expiresAt: message.expiresAt }),
-      ...(message.imported === undefined ? {} : { imported: message.imported })
+      ...(message.imported === undefined ? {} : { imported: message.imported }),
+      ...(message.mine === undefined ? {} : { mine: message.mine }),
+      ...(message.likes === undefined ? {} : { likes: message.likes })
     };
   });
 }
@@ -44,7 +52,8 @@ function encode(bytes: Uint8Array): string {
 }
 
 function decode(value: unknown): Uint8Array<ArrayBuffer> {
-  if (typeof value !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+  // Repeated groups overflow V8's regexp stack for multi-MiB image archives.
+  if (typeof value !== "string" || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
     throw new Error(INVALID_ARCHIVE);
   }
   return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
@@ -58,9 +67,22 @@ async function keyFrom(password: string, salt: Uint8Array<ArrayBuffer>): Promise
   );
 }
 
-export async function encryptHistory(messages: readonly HistoryMessage[], password: string): Promise<string> {
+export function validateExportPasswords(password: string, confirmation: string): void {
   if (!password) throw new Error("请设置导出密码");
-  const plaintext = new TextEncoder().encode(JSON.stringify(messagesFrom(messages)));
+  if (password !== confirmation) throw new Error("两次输入的密码不一致");
+}
+
+export async function encryptHistory(messages: readonly HistoryMessage[], password: string, exporterSessionId?: string): Promise<string> {
+  if (!password) throw new Error("请设置导出密码");
+  const validated = messagesFrom(messages);
+  const likes = exporterSessionId === undefined ? undefined
+    : deriveInteractionState(validated.filter(message => !message.imported)).likes;
+  const snapshot = exporterSessionId === undefined ? validated : validated.map(message => ({
+    ...message,
+    mine: message.imported && message.mine !== undefined ? message.mine : message.senderSessionId === exporterSessionId,
+    likes: message.imported ? (message.likes ?? 0) : (likes!.get(message.id) ?? 0)
+  }));
+  const plaintext = new TextEncoder().encode(JSON.stringify(snapshot));
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await keyFrom(password, salt);

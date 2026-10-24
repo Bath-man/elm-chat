@@ -66,6 +66,14 @@ async function join(origin: string, room: any, creator: boolean, sessionId = cry
   return { ws, result: await next, sessionId, inviteToken };
 }
 describe("CloudBase-compatible Node runtime", () => {
+  it("permits only local blob image previews without allowing remote image hosts", async () => {
+    const { origin } = await setup();
+    const response = await fetch(`${origin}/healthz`);
+    const policy = response.headers.get('content-security-policy')!;
+    expect(policy).toContain("img-src 'self' data: blob:");
+    expect(policy).not.toContain("img-src *");
+  });
+
   it("keeps liveness separate from lease readiness and rejects mutations without ownership",async()=>{
     const store=new MemoryMetadataStore();
     const app=createChatServer({store,publicDir:"/nonexistent",ownsLease:()=>false});

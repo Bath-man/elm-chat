@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent } from "react";
 import { decodeInteraction, interactionText, type MessageEdit } from "./interactions";
+
+import { decodeImage, type ChatImage } from "./image-messages";
+import { ImageThumbnail } from "./ImagePreview";
 
 export type MessageEntrance = { until: number; played?: boolean };
 
 type BubbleMessage = { id: string; plaintext?: string; sentAt: number; delivery?: "pending" | "sent"; imported?: boolean; entrance?: MessageEntrance };
 
-export function MessageBubble({ message, mine, likes, confirmed, answer, edit, onLike, onEdit }: {
+export function MessageBubble({ message, mine, likes, confirmed, answer, edit, onLike, onEdit, onPreviewImage }: {
   message: BubbleMessage;
   mine: boolean;
   likes: number;
@@ -14,6 +17,7 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
   edit?: MessageEdit;
   onLike: () => Promise<boolean>;
   onEdit: () => void;
+  onPreviewImage?: (image: ChatImage) => void;
 }) {
   // UI-only token survives delivery updates and temporary unmounts. Consume it
   // after commit (not during render, which StrictMode can repeat).
@@ -40,8 +44,11 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
   const hold = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const pointer = useRef({ x: 0, y: 0, suppress: false });
   const interaction = decodeInteraction(message.plaintext ?? "");
+  const image = useMemo(() => {
+    try { return decodeImage(message.plaintext ?? ""); } catch { return "invalid" as const; }
+  }, [message.plaintext]);
   const ordinary = !interaction && !message.imported;
-  const canEdit = ordinary && !mine && !edit;
+  const canEdit = ordinary && !image && !mine && !edit;
   const kind = interaction?.type;
   const text = message.plaintext ?? "";
 
@@ -82,7 +89,7 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
   const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(message.sentAt);
   const suffix = kind === "notice.request" ? ` notice${confirmed ? " confirmed" : ""}` : kind === "poll.request" ? " poll" : kind === "poll.answer" ? " answer" : kind === "dice" ? " dice" : kind === "hidden" ? " hidden-message" : "";
 
-  return <article className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${suffix}${ordinary ? " likeable" : ""}${animateEntrance ? " bubble-enter" : ""}`}
+  return <div className={`message-row message-row-${mine ? "mine" : "theirs"}`}><article className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}${suffix}${image && image !== "invalid" ? " bubble-image" : ""}${ordinary ? " likeable" : ""}${animateEntrance ? " bubble-enter" : ""}`}
     onAnimationEnd={event => {
       if (event.target === event.currentTarget && event.animationName === "message-enter") setAnimateEntrance(false);
     }}
@@ -108,14 +115,15 @@ export function MessageBubble({ message, mine, likes, confirmed, answer, edit, o
       if (!canEdit) return;
       event.preventDefault(); clearTimeout(hold.current); pointer.current.suppress = true; setActions(true);
     }}>
-    {interaction?.type === "dice" ? <div className="dice-result"><span className="dice-face" data-value={interaction.value} role="img" aria-label={`${interaction.value} 点`}>{["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"][interaction.value - 1]}</span><span>摇到 {interaction.value} 点</span></div>
+    {image === "invalid" ? <p>图片数据已损坏</p> : image ? <ImageThumbnail image={image} onPreview={onPreviewImage ?? (() => {})} /> : interaction?.type === "dice" ? <div className="dice-result"><span className="dice-face" data-value={interaction.value} role="img" aria-label={`${interaction.value} 点`}>{["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"][interaction.value - 1]}</span><span>摇到 {interaction.value} 点</span></div>
       : interaction?.type === "hidden" ? <div className="hidden-content"><p key={String(revealed)} className={revealed ? "hidden-text" : undefined}>{revealed ? interaction.hidden : interaction.surface}</p><button type="button" className="hidden-toggle" aria-label={revealed ? "显示表面文字" : "显示隐藏文字"} aria-pressed={revealed} onClick={() => setRevealed(!revealed)}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>{revealed && <path d="m3 3 18 18"/>}</svg></button></div>
       : <p>{edit ? <>{text.slice(0, edit.start)}<del>{text.slice(edit.start, edit.end)}</del><ins>{edit.replacement}</ins>{text.slice(edit.end)}</> : interaction ? interactionText(interaction) : text}</p>}
     {kind === "notice.request" && !message.imported && <span className="bubble-state">{confirmed ? "已确认" : "等待确认"}</span>}
     {kind === "poll.request" && !message.imported && <span className="bubble-state">{answer ? `已回答 · ${answer}` : "等待回答"}</span>}
-    <footer>{time}{message.imported ? " · 导入记录" : mine && message.delivery === "pending" ? " · 待发送" : ""}{edit ? " · 已涂改" : ""}</footer>
-    {ordinary && likes > 0 && <span className="bubble-likes" aria-label={`${likes} 次点赞`}><span aria-hidden="true">♥</span><span className="like-count" key={likes}>{likes}</span></span>}
     {hearts.map(heart => <span className="floating-heart" key={heart.id} style={heart.style} onAnimationEnd={() => setHearts(current => current.filter(item => item.id !== heart.id))} aria-hidden="true">♥</span>)}
     {actions && canEdit && <div className="message-actions"><button type="button" onClick={event => { event.stopPropagation(); setActions(false); onEdit(); }}>涂改</button><button type="button" onClick={event => { event.stopPropagation(); setActions(false); }}>取消</button></div>}
-  </article>;
+  </article><footer className="message-meta">
+    <span>{time}{message.imported ? " · 导入记录" : mine && message.delivery === "pending" ? " · 待发送" : ""}{edit ? " · 已涂改" : ""}</span>
+    {!interaction && likes > 0 && <span className="bubble-likes" aria-label={`${likes} 次点赞`}><span aria-hidden="true">♥</span><span className="like-count" key={likes}>{likes}</span></span>}
+  </footer></div>;
 }

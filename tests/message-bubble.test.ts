@@ -47,3 +47,39 @@ describe("V1.1 chat bubble", () => {
     expect(html).toContain("已确认");
   });
 });
+
+describe('archived likes and image bubbles', () => {
+  it('shows imported likes while keeping the bubble read-only', () => {
+    const html = render({ message: { ...message, imported: true }, likes: 5 });
+    expect(html).toContain('5 次点赞');
+    expect(html).not.toContain('aria-label="点赞消息"');
+  });
+  it('shows an image thumbnail instead of raw encoded data and has an explicit preview control', () => {
+    const plaintext = 'elm-image:v1:' + JSON.stringify({ name: 'tiny.png', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII=', width: 1, height: 1 });
+    const html = render({ message: { ...message, plaintext } });
+    expect(html).toContain('查看图片：tiny.png');
+    expect(html).toContain('<img');
+    expect(html).not.toContain('elm-image:v1:');
+  });
+});
+
+
+describe("compact message rows", () => {
+  it("places timestamp and pending state beside, not inside, the bubble", () => {
+    const html = render({ mine: true, message: { ...message, delivery: "pending" } });
+    expect(html).toContain('class="message-row message-row-mine"');
+    expect(html).toContain('</article><footer class="message-meta">');
+    expect(html).toContain('待发送');
+    expect(html.slice(html.indexOf('<article'), html.indexOf('</article>'))).not.toContain('<footer');
+  });
+  it("keeps likes next to the metadata outside the message content", () => {
+    const html = render({ likes: 3 });
+    expect(html).toContain('class="message-row message-row-theirs"');
+    expect(html.indexOf('class="bubble-likes"')).toBeGreaterThan(html.indexOf('</article>'));
+  });
+  it("marks valid image messages for a frameless presentation", () => {
+    const plaintext = 'elm-image:v1:' + JSON.stringify({ name: 'tiny.png', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1cAAAAASUVORK5CYII=', width: 1, height: 1 });
+    expect(render({ message: { ...message, plaintext } })).toMatch(/class="bubble [^"]*bubble-image/);
+    expect(render({ message: { ...message, plaintext: 'elm-image:v1:broken' } })).not.toContain('bubble-image');
+  });
+});
