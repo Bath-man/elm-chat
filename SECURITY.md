@@ -1,47 +1,26 @@
-# Security Policy
+# 安全政策
 
-elm.chat is privacy- and safety-critical software. We take vulnerabilities seriously and appreciate responsible disclosure.
+本项目是基于 [elm-chat](https://github.com/shawnbure/elm-chat) 修改的聊天应用。当前服务端为 CloudBase 上的 Node HTTP/WebSocket 单实例进程，房间状态仅保存在内存；安全报告请注明本仓库版本或提交。
 
-## Reporting a vulnerability
+## 报告漏洞
 
-**Please do not open a public GitHub issue for security vulnerabilities.**
+请勿在公开 Issue 中发布可利用的漏洞细节、房间链接、恢复凭证或聊天内容。通过当前仓库的 Security → Report a vulnerability（如已启用），或仓库维护者公开提供的私下联系方式报告。若问题仅涉及未修改的上游代码，也可联系[上游安全报告入口](https://github.com/shawnbure/elm-chat/security/advisories/new)。
 
-Instead, report privately through one of:
+报告应包含受影响组件与提交、复现步骤、影响和可能的缓解方式。仅使用自建本地服务或所有参与者明确同意的测试房间，不访问他人数据、不破坏服务。
 
-- GitHub's **[Private vulnerability reporting](https://github.com/shawnbure/elm-chat/security/advisories/new)** (preferred — go to the repo's Security tab → "Report a vulnerability").
-- Email the maintainer directly (see the GitHub profile for contact).
+## 重点范围
 
-Please include:
+- `packages/crypto`：密钥协商、加密、签名及秘密处理。
+- `apps/server`：房间访问控制、邀请、重连凭证验证和消息中继。
+- `apps/web`：XSS、秘密暴露、本地存储、图片处理与加密备份。
+- 使未授权方读取消息、冒用身份或绕过双人准入限制的问题。
 
-- a description of the issue and its impact,
-- steps to reproduce (proof-of-concept if possible),
-- affected component(s) and version/commit,
-- any suggested mitigation.
+## 已知保护边界
 
-## What to expect
+- 端到端加密不保护已失陷的浏览器、恶意扩展、截图或剪贴板，也无法阻止对方保存或转发明文、邀请和房间秘密。
+- IndexedDB 保存本机明文历史，身份密钥和恢复凭证保存在同源 localStorage；设备使用者可访问这些数据。`.achat` 仅保护导出的备份文件，密码遗失无法恢复。
+- 服务端及托管平台仍能接触请求、连接时间、房间标识等网络元数据；TLS 和端到端加密不提供完整匿名性。
+- 房间失效只终止服务端房间与准入，不删除浏览器历史或已导出的备份；不能将其宣传为所有副本均已销毁。
+- 多进程、多实例和跨版本分流不受支持。进程退出会丢失房间，不提供持久化、无损发布或云端离线投递保证。
 
-- **Acknowledgement** within 72 hours.
-- An initial assessment and severity rating within 7 days.
-- Coordinated disclosure: we'll agree on a timeline and credit you (if you wish) in the advisory and release notes.
-
-## Scope
-
-This policy welcomes good-faith reports, but it does not grant permission to disrupt the service, access another person's data, use social engineering, or test against anyone's room without every participant's explicit authorization. Use the minimum interaction and data necessary to demonstrate an issue.
-
-In scope:
-
-- the encryption / key-exchange / secret-handling code (`packages/crypto`, room secret in URL fragment),
-- the Worker API and Durable Object room logic (metadata leakage, access control, invite handling),
-- the web client (XSS, secret exposure, storage of sensitive material),
-- anything that lets the server, an attacker, or a third party read, retain, or reconstruct message content or deanonymize participants.
-
-Out of scope (known and documented — see the [archived upstream threat model](docs/archive/upstream/docs/threat-model.md)):
-
-- compromise of a participant's own device (screenshots, clipboard, malware),
-- a participant voluntarily forwarding plaintext, screenshots, or the room secret,
-- transport-level metadata that is inherent to any networked system,
-- social engineering of participants.
-
-## A note on claims
-
-Per the project's own disclaimer: elm.chat should **not** be marketed or relied upon as a completed high-assurance safety tool until its protocol, implementation, and operational guarantees have been independently reviewed under realistic threat conditions. Security reports that move us toward that bar are exactly what we want.
+项目未完成独立安全审计，不应宣称已达到高保障通信标准。已执行检查和未验证范围见 [TEST-RESULTS.md](TEST-RESULTS.md)。

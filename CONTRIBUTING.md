@@ -50,8 +50,8 @@ node scripts/check-memory-restart-browser.mjs
 | `check-room-recovery-browser.mjs` | 双人加密聊天、刷新/关页恢复、断网、准入限制、失效后本地记录 | 已启动的本地服务，设置 `TEST_ORIGIN` |
 | `check-memory-restart-browser.mjs` | 真实进程重启、旧房失效、凭证/待发内容保留、本地备份、新房隔离 | 已构建，脚本自行启动服务 |
 | `mobile-smoke.mjs` | 手机视口下文字、提醒/调查、去重、待发队列和布局 | 已启动的本地服务，设置 `TEST_ORIGIN` |
-| `check-composer-motion-browser.mjs` | 发送焦点与新消息动画 | 脚本自行启动前端测试服务 |
-| `check-room-hooks-browser.mjs` | React Hooks 在挂载与重连时收敛 | 脚本自行启动前端测试服务 |
+| `check-composer-motion-browser.mjs` | 发送焦点与新消息动画 | 独立组件测试，无需服务 |
+| `check-room-hooks-browser.mjs` | React Hooks 在挂载与重连时收敛 | 独立组件测试，无需服务 |
 | `check-message-likes-browser.mjs` | 桌面/触控连续点赞、焦点、动画与刷新恢复 | 已启动的本地前端，设置 `TEST_ORIGIN` |
 
 使用已有 Chromium 时，`mobile-smoke.mjs` 设置 `CHROMIUM_PATH`，表中其余脚本设置 `CHROME_PATH`。测试仅使用本地服务，不要把 `TEST_ORIGIN` 指向线上房间。触控模拟不能代替实体手机与系统键盘验收。

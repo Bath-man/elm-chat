@@ -19,17 +19,9 @@
 
 现有手机冒烟脚本曾使用旧版互动菜单/回复选择器，本轮同步改为当前菜单入口、提醒确认状态及调查回复计数后通过。恢复脚本与新增重启脚本均使用真实HTTP/WebSocket及浏览器IndexedDB，不模拟房间响应。
 
-## 复现
+## 复现与文档维护
 
-先运行 `npm run build`。使用外部Playwright和Chromium执行自管理服务的进程重启验证：
-
-```bash
-PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs \
-CHROME_PATH=/path/to/chromium \
-node scripts/check-memory-restart-browser.mjs
-```
-
-该脚本只启动和关闭自身的本地临时服务。恢复/手机脚本则先运行 `PORT=5210 npm start`，设置 `TEST_ORIGIN=http://127.0.0.1:5210`；恢复脚本使用 `CHROME_PATH`，手机脚本使用 `CHROMIUM_PATH`。
+检查命令及浏览器工具配置统一见[开发与贡献](CONTRIBUTING.md#浏览器回归)。本次文档整理只更新当前说明、删除过期文档和图片，未修改应用代码；上表记录的是同日无数据库改造时已执行的测试，不表示文档整理后重新运行了完整测试。
 
 ## 验证边界
 
@@ -39,4 +31,3 @@ node scripts/check-memory-restart-browser.mjs
 - 无独立ESLint配置，未声称lint通过；以TypeScript、协议检查、构建、脚本语法检查和功能回归验证。
 - 服务器无跨实例协调，实例/进程/版本重叠不提供一致性或无损交接。最大副本1不能代替跨版本单实例发布约束。
 
-早期CloudBase验证见[历史快照](docs/archive/validation/cloudbase-2026-10-23.md)，不代表本轮实现。
