@@ -752,7 +752,9 @@ function InviteCheckingScreen({ connection, error, onRetry, focusRef, restoring 
   );
 }
 
-function RoomGoneScreen({ fromInvite, reason, focusRef }: { fromInvite: boolean; reason?: string } & RecoveryFocusTarget) {
+export function RoomGoneScreen({ fromInvite, reason, focusRef, onViewHistory, historyLoaded }: {
+  fromInvite: boolean; reason?: string; onViewHistory: () => void; historyLoaded: boolean;
+} & RecoveryFocusTarget) {
   return (
     <main className="room-shell room-shell-centered">
       <section className="access-screen" aria-live="polite">
@@ -768,6 +770,8 @@ function RoomGoneScreen({ fromInvite, reason, focusRef }: { fromInvite: boolean;
         >
           {t("startNew")} &rarr;
         </a>
+        <button className="secondary-button" type="button" disabled={!historyLoaded} onClick={onViewHistory}>查看本地记录</button>
+        <p className="access-copy">本地记录仍保留，可查看、导入和导出。继续聊天请创建新房间。</p>
         {fromInvite ? <MakeYourOwnCallout /> : null}
       </section>
     </main>
@@ -913,6 +917,7 @@ function RoomPage({ roomId }: { roomId: string }) {
   const [roomNotice, setRoomNotice] = useState<string | null>(null);
   const concealment = useConversationConcealment(() => conversationFind.close());
   const [notFound, setNotFound] = useState(false);
+  const [viewLocalHistory, setViewLocalHistory] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<ActionFeedback>("idle");
   const [destroyFeedback, setDestroyFeedback] = useState<ActionFeedback>("idle");
   const [inviteFeedback, setInviteFeedback] = useState<InviteFeedback>("idle");
@@ -1105,18 +1110,20 @@ function RoomPage({ roomId }: { roomId: string }) {
     void rotateRoomKey(keyEpoch);
   }
 
-  function clearRoomSecurityState(preserveSession = false) {
+  function clearRoomSecurityState(preserveSession = false, preserveBrowserData = false) {
     conversationFind.close();
     setPreviewImage(null);
     imageAssemblerRef.current.clear();
     for (const [fileId, transfer] of incomingFilesRef.current) removeIncomingFile(fileId, transfer);
-    replayGuardRef.current?.clear();
-    eventReplayGuardRef.current?.clear();
+    if (!preserveBrowserData) {
+      replayGuardRef.current?.clear();
+      eventReplayGuardRef.current?.clear();
+    }
     roomKeysRef.current.clear();
     pendingEnvelopesRef.current.clear();
     keyReadyRef.current = false;
     setKeyReady(false);
-    if (!preserveSession) {
+    if (!preserveSession && !preserveBrowserData) {
       reconnectTokenRef.current = "";
       safeStorageRemove("local", reconnectTokenKey(roomId, sessionId));
       safeStorageRemove("local", identityKeyPairKey(roomId, sessionId));
@@ -1454,7 +1461,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         setRoom(metadata);
         if (metadata.status !== "open") {
           stopReconnecting();
-          clearRoomSecurityState();
+          clearRoomSecurityState(true, true);
           setReady(true);
           setConnection(t("closed"));
           setRoomNotice(roomStateMessage(metadata.status));
@@ -1636,7 +1643,7 @@ function RoomPage({ roomId }: { roomId: string }) {
               setDestroyFeedback(payload.status === "destroyed" ? "success" : "idle");
               setConnection(t("closed"));
             });
-            clearRoomSecurityState();
+            clearRoomSecurityState(true, true);
             await sendPeerData({ type: "peer_destroy" });
             return;
           }
@@ -1696,7 +1703,10 @@ function RoomPage({ roomId }: { roomId: string }) {
         if (!connectionAllowed()) return;
         if (cause instanceof RoomMetadataError && cause.kind === "missing") {
           stopReconnecting();
-          clearRoomSecurityState();
+          clearRoomSecurityState(true, true);
+          joinedRef.current = false;
+          setRoom(null);
+          setConnection(t("closed"));
           setNotFound(true);
           setReady(true);
           return;
@@ -1976,7 +1986,7 @@ function RoomPage({ roomId }: { roomId: string }) {
         stopReconnecting();
         setRoomNotice(t("peerDestroyed"));
         setConnection(t("closed"));
-        clearRoomSecurityState();
+        clearRoomSecurityState(true, true);
       }
     }
 
@@ -2018,30 +2028,6 @@ function RoomPage({ roomId }: { roomId: string }) {
     const timeout = window.setTimeout(() => setDestroyFeedback("idle"), 2200);
     return () => window.clearTimeout(timeout);
   }, [destroyFeedback]);
-
-  // HTTP follows the currently published version; an existing WS can still point
-  // at the previous container after rollout. Never use WS frames to request takeover.
-  useEffect(() => {
-    let request: AbortController | undefined;
-    let deadline: number | undefined;
-    const checkRuntime = () => {
-      if (document.hidden || request) return;
-      const controller = new AbortController();
-      request = controller;
-      deadline = window.setTimeout(() => controller.abort(), 5000);
-      void fetch("/api/runtime", { cache: "no-store", signal: controller.signal })
-        .catch(() => {})
-        .finally(() => { window.clearTimeout(deadline); request = undefined; });
-    };
-    checkRuntime();
-    const interval = window.setInterval(checkRuntime, 15000);
-    document.addEventListener("visibilitychange", checkRuntime);
-    return () => {
-      window.clearInterval(interval); window.clearTimeout(deadline);
-      document.removeEventListener("visibilitychange", checkRuntime);
-      request?.abort();
-    };
-  }, [roomId]);
 
   useEffect(() => {
     if (!ready || room?.status !== "open") {
@@ -2523,52 +2509,59 @@ function RoomPage({ roomId }: { roomId: string }) {
     return <InvalidInviteScreen reason={inviteAccess} focusRef={setRetryFocusTarget} />;
   }
 
-  if (notFound) {
+  const localOnly = notFound || Boolean(ready && room && room.status !== "open");
+
+  if (notFound && !viewLocalHistory) {
     return (
       <RoomGoneScreen
         fromInvite={isInviteGuest}
         reason={t("roomNotFound")}
+        onViewHistory={() => setViewLocalHistory(true)}
+        historyLoaded={historyLoaded}
         focusRef={setRetryFocusTarget}
       />
     );
   }
 
-  if (ready && room && room.status !== "open") {
+  if (ready && room && room.status !== "open" && !viewLocalHistory) {
     return (
       <RoomGoneScreen
         fromInvite={isInviteGuest}
         reason={roomNotice ?? roomStateMessage(room.status)}
+        onViewHistory={() => setViewLocalHistory(true)}
+        historyLoaded={historyLoaded}
         focusRef={setRetryFocusTarget}
       />
     );
   }
 
-  if (!concealment.hidden && isInviteGuest && (inviteAccess !== "granted" || !room || !ready)) {
+  if (!localOnly && !concealment.hidden && isInviteGuest && (inviteAccess !== "granted" || !room || !ready)) {
     return <InviteCheckingScreen connection={connection} error={connectionError ?? error} restoring={restoringSession}
       focusRef={setRetryFocusTarget}
       onRetry={canRetryConnection ? () => retryConnectionRef.current?.() : undefined} />;
   }
 
-  const pending = historyLoaded ? pendingInteractions(messages.filter((m): m is HistoryMessage => !m.imported && m.kind === "text" && typeof m.plaintext === "string"), sessionId) : [];
+  const pending = historyLoaded && !localOnly ? pendingInteractions(messages.filter((m): m is HistoryMessage => !m.imported && m.kind === "text" && typeof m.plaintext === "string"), sessionId) : [];
   const pendingCount = messages.filter((message) => !message.imported && message.delivery === "pending").length;
   const inviteLink = invites.find((invite) => canShareInvite(invite, now));
   return <main className="room-shell">
+    {localOnly && <p className="local-note" role="status">房间已失效，本地记录仍保留；此处仅供查看、导入和导出。<a href="/">创建新房间</a></p>}
     <header className="room-header">
-      <div><h1>匿名聊天</h1><p className="room-subtitle">{!historyLoaded ? "正在读取本地记录…" : !ready ? restoringSession ? t("restoringSession") : "正在连接…" : !keyReady ? connection : presence.count > 1 ? "对方在线 · 端到端加密" : "等待对方上线 · 端到端加密"}</p></div>
+      <div><h1>匿名聊天</h1><p className="room-subtitle">{!historyLoaded ? "正在读取本地记录…" : localOnly ? "仅本地记录 · 房间已失效" : !ready ? restoringSession ? t("restoringSession") : "正在连接…" : !keyReady ? connection : presence.count > 1 ? "对方在线 · 端到端加密" : "等待对方上线 · 端到端加密"}</p></div>
       <div className="room-actions">
         <ThemeToggle />
-        {isCreator && <button className="secondary-button" onClick={handleShareInvite} ref={inviteTriggerRef} disabled={!ready || presence.count >= 2}>邀请</button>}
+        {!localOnly && isCreator && <button className="secondary-button" onClick={handleShareInvite} ref={inviteTriggerRef} disabled={!ready || presence.count >= 2}>邀请</button>}
         <button className="secondary-button" onClick={exitRoom}>退出房间</button>
       </div>
     </header>
-    {interactionState.pin && <aside className="pinned-area" aria-label="共享置顶">
+    {!localOnly && interactionState.pin && <aside className="pinned-area" aria-label="共享置顶">
       <div className="pinned-bubble" style={{ backgroundColor: interactionState.pin.color, color: contrastColor(interactionState.pin.color) }}>
         <span className="pin-mark" aria-hidden="true">⌁</span><p>{interactionState.pin.text}</p>
         <button type="button" aria-label="编辑置顶" onClick={() => openInteraction("pin")} disabled={!historyLoaded}>编辑</button>
         <button type="button" aria-label="删除置顶" onClick={() => void sendInteraction({ type: "pin.delete", id: generateMessageId() })} disabled={!historyLoaded}>×</button>
       </div>
     </aside>}
-    {inviteLink && isCreator && <div className="invite-panel">
+    {!localOnly && inviteLink && isCreator && <div className="invite-panel">
       <label htmlFor="invite-link">邀请链接（10 分钟内一次有效）</label>
       <input id="invite-link" readOnly value={buildInviteUrl(roomId, inviteLink.token, roomSecret)} onFocus={(event) => event.target.select()} />
       <button className="secondary-button" onClick={(event) => handleCopyInvite(inviteLink.token, event.currentTarget)}>{inviteFeedback === "copied" ? "已复制" : "复制链接"}</button>
@@ -2600,14 +2593,14 @@ function RoomPage({ roomId }: { roomId: string }) {
         <button className={`secondary-button composer-plus${showMore ? " is-open" : ""}`} type="button" aria-label="更多功能" aria-expanded={showMore} aria-controls="chat-more-menu" disabled={!historyLoaded} onClick={() => setShowMore(!showMore)}>+</button>
         {showMore && <div id="chat-more-menu" className="more-menu" role="menu" aria-label="聊天工具" onKeyDown={event => { if (event.key === "Escape") setShowMore(false); }}>
           <div className="more-menu-group" role="group" aria-label="消息互动">
-            <button type="button" role="menuitem" onClick={() => { setShowMore(false); void sendInteraction({ type: "dice", id: generateMessageId(), value: Math.floor(Math.random() * 6) + 1 }); }}><span aria-hidden="true">⚄</span>摇骰子</button>
+            <button type="button" role="menuitem" disabled={localOnly} onClick={() => { setShowMore(false); void sendInteraction({ type: "dice", id: generateMessageId(), value: Math.floor(Math.random() * 6) + 1 }); }}><span aria-hidden="true">⚄</span>摇骰子</button>
             <button type="button" role="menuitem" disabled={imageBusy || !keyReady || room?.status !== "open"} onClick={() => { setShowMore(false); imageInputRef.current?.click(); }}><span aria-hidden="true">▧</span>{imageBusy ? "正在处理图片…" : "发送图片"}</button>
           </div>
           <div className="more-menu-group" role="group" aria-label="更多工具">
-            <button type="button" role="menuitem" onClick={() => openInteraction("notice")}><span aria-hidden="true">◷</span>发送提醒</button>
-            <button type="button" role="menuitem" onClick={() => openInteraction("poll")}><span aria-hidden="true">☷</span>单选调查</button>
-            <button type="button" role="menuitem" onClick={() => openInteraction("pin")}><span aria-hidden="true">⌁</span>置顶气泡</button>
-            <button type="button" role="menuitem" onClick={() => openInteraction("hidden")}><span aria-hidden="true">◉</span>隐藏信息</button>
+            <button type="button" role="menuitem" disabled={localOnly} onClick={() => openInteraction("notice")}><span aria-hidden="true">◷</span>发送提醒</button>
+            <button type="button" role="menuitem" disabled={localOnly} onClick={() => openInteraction("poll")}><span aria-hidden="true">☷</span>单选调查</button>
+            <button type="button" role="menuitem" disabled={localOnly} onClick={() => openInteraction("pin")}><span aria-hidden="true">⌁</span>置顶气泡</button>
+            <button type="button" role="menuitem" disabled={localOnly} onClick={() => openInteraction("hidden")}><span aria-hidden="true">◉</span>隐藏信息</button>
           </div>
           <div className="more-menu-group" role="group" aria-label="记录备份">
             <button type="button" role="menuitem" onClick={() => openArchive("import")}><span aria-hidden="true">↑</span>导入记录</button>

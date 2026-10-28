@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import { connect } from "node:net";
 import { randomBytes } from "node:crypto";
@@ -17,6 +17,7 @@ async function start(store = new MemoryMetadataStore()) {
   return { app, origin, store };
 }
 afterEach(async () => {
+  vi.useRealTimers();
   for (const ws of sockets.splice(0)) ws.terminate();
   for (const entry of running.splice(0)) await entry.app.close();
 });
@@ -74,93 +75,22 @@ describe("CloudBase-compatible Node runtime", () => {
     expect(policy).not.toContain("img-src *");
   });
 
-  it("keeps liveness separate from lease readiness and rejects mutations without ownership",async()=>{
-    const store=new MemoryMetadataStore();
-    const app=createChatServer({store,publicDir:"/nonexistent",ownsLease:()=>false});
-    await new Promise<void>(resolve=>app.server.listen(0,"127.0.0.1",resolve));
-    const origin=`http://127.0.0.1:${(app.server.address() as {port:number}).port}`;
-    try {
-      expect((await fetch(`${origin}/healthz`)).status).toBe(200);
-      expect((await fetch(`${origin}/readyz`)).status).toBe(503);
-      expect((await fetch(`${origin}/api/rooms`,{method:"POST",body:"{}"})).status).toBe(503);
-      expect(store.snapshot()).toEqual({});
-    } finally {await app.close();}
-  });
-  it("only user API traffic wakes the runtime, not probes, assets or foreign origins", async () => {
-    let owned = false, activity = 0;
-    const app = createChatServer({store:new MemoryMetadataStore(),publicDir:"/nonexistent",ownsLease:()=>owned,
-      onActivity:async()=>{activity++;owned=true;}});
-    await new Promise<void>(resolve=>app.server.listen(0,"127.0.0.1",resolve));
-    const origin=`http://127.0.0.1:${(app.server.address() as {port:number}).port}`;
-    try {
-      expect((await fetch(`${origin}/readyz`)).status).toBe(503);
-      await fetch(`${origin}/healthz`);await fetch(`${origin}/`);
-      expect((await fetch(`${origin}/api/runtime`,{headers:{origin:"https://other.example"}})).status).toBe(403);
-      expect(activity).toBe(0);
-      const runtime=await fetch(`${origin}/api/runtime`);
-      expect(runtime.status).toBe(200);expect(await runtime.json()).toEqual({ready:true});
-      expect(runtime.headers.get("cache-control")).toBe("no-store");
-      await create(origin);expect(activity).toBe(2);
-    } finally {await app.close();}
-  });
-  it("wakes on valid WebSocket admission but never on socket messages or rejected handshakes", async () => {
-    let owned=true,activity=0;
-    const app=createChatServer({store:new MemoryMetadataStore(),publicDir:"/nonexistent",ownsLease:()=>owned,
-      onActivity:()=>{activity++;owned=true;}});
-    await new Promise<void>(resolve=>app.server.listen(0,"127.0.0.1",resolve));
-    const origin=`http://127.0.0.1:${(app.server.address() as {port:number}).port}`;
-    try {
-      const room=await create(origin);activity=0;owned=false;
-      const url=new URL(origin);
-      for (const headers of ["Sec-WebSocket-Version: 13\r\n", "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nOrigin: https://other.example\r\n"]) {
-        await new Promise<void>((done,reject)=>{
-          const socket=connect(Number(url.port),url.hostname,()=>socket.write(`GET /api/rooms/${room.roomId}/ws HTTP/1.1\r\nHost: ${url.host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n${headers}\r\n`));
-          socket.on("data",()=>{});socket.once("close",()=>done());socket.once("error",reject);
-        });
-      }
-      expect(activity).toBe(0);
-      const creator=await join(origin,room,true);expect(creator.result.type).toBe("joined");expect(activity).toBe(1);
-      const response=event(creator.ws,"error");creator.ws.send(JSON.stringify({type:"peer_data",data:{type:"sync_request"}}));await response;
-      expect(activity).toBe(1);
-    } finally {await app.close();}
-  });
-  it("waits for metadata loading during a drain and never caches that old snapshot after resume", async () => {
-    const first=await setup();const room=await create(first.origin);
-    const original=first.store.load.bind(first.store);
-    let release!:()=>void,loaded!:()=>void;
-    const loading=new Promise<void>(resolve=>{loaded=resolve;});
-    const gate=new Promise<void>(resolve=>{release=resolve;});
-    first.store.load=async id=>{const value=await original(id);loaded();await gate;return value;};
-    const second=await setup(first.store);
-    const pending=fetch(`${second.origin}/api/rooms/${room.roomId}`);
-    await loading;
-    let drained=false;const drain=second.app.pause().then(()=>{drained=true;});
-    await new Promise(resolve=>setTimeout(resolve,10));expect(drained).toBe(false);
-    release();await drain;expect((await pending).status).toBe(503);
-    first.store.load=original;
-    const values=await original(room.roomId);(values!["room:meta"] as Record<string,unknown>).maxAgeMs=765432;
-    await first.store.save(room.roomId,values!);
-    second.app.resume();
-    expect((await (await fetch(`${second.origin}/api/rooms/${room.roomId}`)).json()).maxAgeMs).toBe(765432);
-  });
-  it("drains sockets, stays live, then reloads durable seats on resume and closes normally", async () => {
-    const {app,origin,store}=await setup();const room=await create(origin);
-    await join(origin,room,true);const guest=await join(origin,room,false);
-    const disconnected=new Promise(resolve=>guest.ws.once("close",resolve));
-    await app.pause();await disconnected;await app.pause();
+  it("is immediately ready without a lease or database and has no handoff endpoint", async () => {
+    const { origin } = await setup();
     expect((await fetch(`${origin}/healthz`)).status).toBe(200);
-    expect((await fetch(`${origin}/readyz`)).status).toBe(503);
-    const runtime=await fetch(`${origin}/api/runtime`);
-    expect(runtime.status).toBe(503);expect(await runtime.json()).toEqual({ready:false});
-    expect((await fetch(`${origin}/api/rooms/${room.roomId}`)).status).toBe(503);
-    const values=await store.load(room.roomId);
-    const meta=values!["room:meta"] as Record<string,unknown>;
-    meta.maxAgeMs=123456;await store.save(room.roomId,values!);
-    app.resume();expect((await fetch(`${origin}/readyz`)).status).toBe(200);
-    expect((await (await fetch(`${origin}/api/rooms/${room.roomId}`)).json()).maxAgeMs).toBe(123456);
-    expect((await join(origin,room,false,guest.sessionId,key,guest.inviteToken,guest.result.reconnectToken)).result.type).toBe("joined");
-    expect((await join(origin,room,false)).result.code).toBe("room_full");
-    await app.pause();await app.close();expect(app.server.listening).toBe(false);
+    expect((await fetch(`${origin}/readyz`)).status).toBe(200);
+    expect((await fetch(`${origin}/api/runtime`)).status).toBe(404);
+    await create(origin);
+  });
+  it("rejects unknown room metadata, invitations, destruction and sockets without creating room state", async () => {
+    const { origin, store } = await setup();
+    const url = `${origin}/api/rooms/missing`;
+    expect((await fetch(url)).status).toBe(404);
+    for (const action of ["invites", "invites/revoke", "destroy"]) {
+      expect((await fetch(`${url}/${action}`, { method: "POST", body: JSON.stringify({ creatorToken: "old", token: "old" }) })).status).toBe(404);
+    }
+    expect(await socketRejection(origin, "missing")).toBe(404);
+    expect(store.snapshot()).toEqual({});
   });
   it("creates rooms without exposing creator capability in metadata; health works", async () => {
     const { origin } = await setup(); const room = await create(origin);
@@ -199,22 +129,6 @@ describe("CloudBase-compatible Node runtime", () => {
     expect((await fetch(`${origin}/api/rooms/${room.roomId}/destroy`, { method: "POST", body: JSON.stringify({creatorToken:"bad"}) })).status).toBe(403);
     expect((await fetch(`${origin}/api/rooms/${room.roomId}/invites`, {headers:{authorization:`Bearer ${room.creatorToken}`}})).status).toBe(200);
     expect((await fetch(`${origin}/api/rooms`,{method:"POST",body:"{"})).status).toBe(400);
-  });
-  it("does not strand the queue when a socket disconnects during metadata loading",async()=>{
-    const first=await setup(); const room=await create(first.origin);
-    const original=first.store.load.bind(first.store);
-    first.store.load=async id=>{await new Promise(resolve=>setTimeout(resolve,150));return original(id);};
-    const second=await setup(first.store);const url=new URL(second.origin);
-    await new Promise<void>((done,reject)=>{
-      const socket=connect(Number(url.port),url.hostname,()=>{
-        socket.write(`GET /api/rooms/${room.roomId}/ws HTTP/1.1\r\nHost: ${url.host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n`);
-        setTimeout(()=>{socket.resetAndDestroy();done();},20);
-      });socket.on("error",reject);
-    });
-    await new Promise(resolve=>setTimeout(resolve,250));
-    const res=await fetch(`${second.origin}/api/rooms/${room.roomId}`,{signal:AbortSignal.timeout(1000)});
-    expect(res.status).toBe(200);
-    expect((await join(second.origin,room,true)).result.type).toBe("joined");
   });
   it("preserves two admitted seats, reconnect identity and single-use invitations", async () => {
     const { origin } = await setup(); const room = await create(origin);
@@ -308,13 +222,10 @@ describe("CloudBase-compatible Node runtime", () => {
     expect(metadata).toMatchObject({participantCount:2,membershipVersion});
   });
   it("restores both identities after invite expiry without consuming another invitation", async () => {
-    const { origin, store } = await setup(); const room = await create(origin);
+    const { origin } = await setup(); const room = await create(origin);
     const creator = await join(origin, room, true); const guest = await join(origin, room, false);
-    const values = (await store.load(room.roomId))!;
-    const invitations = values["room:invites"] as [string, {expiresAt:number}][];
-    invitations[0][1].expiresAt = Date.now() - 1;
-    await store.save(room.roomId, values);
-    await running[running.length - 1].app.pause(); running[running.length - 1].app.resume();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 11 * 60_000);
     expect((await join(origin, room, false, guest.sessionId, key, undefined, guest.result.reconnectToken)).result.type).toBe("joined");
     expect((await join(origin, room, false, creator.sessionId, key, undefined, creator.result.reconnectToken)).result.creator).toBe(true);
   });
@@ -331,14 +242,14 @@ describe("CloudBase-compatible Node runtime", () => {
     expect(await socketRejection(origin, room.roomId)).toBe(410);
   });
   it("rejects old recovery credentials once the room has expired", async () => {
-    const {origin, app, store} = await setup(); const room = await create(origin);
-    const creator = await join(origin, room, true);
-    await app.pause();
-    const values = (await store.load(room.roomId))!;
-    (values["room:meta"] as {expiresAt:number}).expiresAt = Date.now() - 1;
-    await store.save(room.roomId, values); app.resume();
+    const {origin} = await setup();
+    const response = await fetch(`${origin}/api/rooms`, { method: "POST", body: JSON.stringify({ maxAgeMs: 1000 }) });
+    const expiring = await response.json();
+    const creator = await join(origin, expiring, true);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 1001);
     expect(creator.result.reconnectToken).toBeTruthy();
-    expect(await socketRejection(origin, room.roomId)).toBe(410);
+    expect(await socketRejection(origin, expiring.roomId)).toBe(410);
   });
   it("rejects kicked member credentials even after the member is offline", async () => {
     const {origin} = await setup(); const room = await create(origin);
@@ -347,20 +258,6 @@ describe("CloudBase-compatible Node runtime", () => {
     creator.ws.send(JSON.stringify({type:"kick_participant",creatorToken:room.creatorToken,targetSessionId:guest.sessionId}));
     await kicked;
     expect((await join(origin, room, false, guest.sessionId, key, guest.inviteToken, guest.result.reconnectToken)).result.code).toBe("reconnect_required");
-  });
-  it("upgrades only legacy creator admissions with a private creator credential", async () => {
-    const {origin, app, store} = await setup(); const room = await create(origin);
-    const creator = await join(origin, room, true); const guest = await join(origin, room, false);
-    await app.pause();
-    const values = (await store.load(room.roomId))!;
-    for (const seat of (values["room:meta"] as {admittedSessions:Record<string,unknown>[]}).admittedSessions) {
-      delete seat.reconnectTokenHash; delete seat.creator;
-    }
-    await store.save(room.roomId, values); app.resume();
-    expect((await join(origin, room, false, guest.sessionId, key, guest.inviteToken)).result.code).toBe("reconnect_required");
-    const upgraded = await join(origin, room, true, creator.sessionId);
-    expect(upgraded.result).toMatchObject({type:"joined",creator:true});
-    expect(upgraded.result.reconnectToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
   it("serializes simultaneous joins so only two identities are admitted", async () => {
     const { origin } = await setup(); const room = await create(origin);
@@ -395,17 +292,24 @@ describe("CloudBase-compatible Node runtime", () => {
     expect((await next).data).toEqual(data);
     expect(JSON.stringify(store.snapshot())).not.toContain("DO_NOT_PERSIST_CIPHERTEXT");
   });
-  it("restores admitted seats and invites after server restart", async () => {
-    const first=await setup(); const room=await create(first.origin);
-    await join(first.origin,room,true); const guest=await join(first.origin,room,false);
-    for(const ws of sockets.splice(0)) ws.terminate();
-    await first.app.close(); running.splice(running.indexOf(first),1);
-    const second=await setup(first.store);
-    expect((await join(second.origin,room,false,guest.sessionId,key,guest.inviteToken,guest.result.reconnectToken)).result.type).toBe("joined");
-    expect((await join(second.origin,room,false)).result.code).toBe("room_full");
+  it("loses rooms, invitations and admitted identities after server restart", async () => {
+    const first = await setup(); const room = await create(first.origin);
+    await join(first.origin, room, true); const guest = await join(first.origin, room, false);
+    await first.app.close(); running.splice(running.indexOf(first), 1);
+    const second = await setup();
+    expect((await fetch(`${second.origin}/api/rooms/${room.roomId}`)).status).toBe(404);
+    expect(await socketRejection(second.origin, room.roomId)).toBe(404);
+    expect((await fetch(`${second.origin}/api/rooms/${room.roomId}/invites`, {
+      method: "POST", body: JSON.stringify({ creatorToken: room.creatorToken })
+    })).status).toBe(404);
+    expect(second.store.snapshot()).toEqual({});
+    expect(guest.result.reconnectToken).toBeTruthy();
+    const replacement = await create(second.origin);
+    expect(replacement.roomId).not.toBe(room.roomId);
+    expect((await join(second.origin, replacement, true)).result.type).toBe("joined");
   });
   it("fails closed when metadata cannot be saved",async()=>{
-    const store=new MemoryMetadataStore(); store.save=async()=>{throw new Error("database unavailable");};
+    const store=new MemoryMetadataStore(); store.save=async()=>{throw new Error("room state unavailable");};
     const {origin}=await setup(store);
     expect((await fetch(`${origin}/api/rooms`,{method:"POST",body:"{}"})).status).toBe(503);
   });

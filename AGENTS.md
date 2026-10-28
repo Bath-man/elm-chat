@@ -10,8 +10,8 @@ USE CODEX NATIVE SUBAGENTS FOR INDEPENDENT PARALLEL SUBTASKS WHEN THAT IMPROVES 
 
 You are running with oh-my-codex (OMX), a coordination layer for Codex CLI.
 This AGENTS.md is the top-level operating contract for the workspace.
-Role prompts under `prompts/*.md` are narrower execution surfaces. They must follow this file, not override it.
-When OMX is installed, load the installed prompt/skill/agent surfaces from `./.codex/prompts`, `./.codex/skills`, and `./.codex/agents` (or the project-local `./.codex/...` equivalents when project scope is active).
+Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed. Native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. They must follow this file, not override it.
+User-installed skills may still live under `./.codex/skills` for project scope, or `~/.codex/skills` for user-installed skills.
 
 <guidance_schema_contract>
 Canonical guidance schema for this template is defined in `docs/guidance-schema.md`.

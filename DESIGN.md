@@ -1,6 +1,6 @@
 # Design
 ## Source of truth
-Active · 2026-10-23。依据 V1 需求及 CloudBase 全量迁移要求；沿用 React/Vite 和现有加密协议，Node.js 同源 HTTP/WebSocket 服务替代 Worker/Durable Object，CloudBase 文档数据库仅存元数据。
+Active · 2026-10-28。依据 V1 需求及 CloudBase 全量迁移要求；沿用 React/Vite 和现有加密协议，Node.js 同源 HTTP/WebSocket 服务替代 Worker/Durable Object，CloudBase 仅提供容器运行环境，房间、邀请和准入状态只保存在 Node 进程内存。
 ## Brand
 极简、安静、白色；不使用渐变、插画或无关装饰。点赞保留轻量爱心反馈：起点、方向和速度小幅随机，约1.15～1.45秒渐隐，每颗独立播放。
 ## Product goals
@@ -28,8 +28,8 @@ Active · 2026-10-23。依据 V1 需求及 CloudBase 全量迁移要求；沿用
 ## Content voice
 简短中文，直接说明动作和失败原因。
 ## Implementation constraints
-仅新增迁移所需的 WebSocket 与 CloudBase 服务端依赖；单容器运行，数据库租约防止多个活动实例，生产禁止本地文件存储；互动内容包装在现有加密文字消息内部，不更改密钥协商/签名/AES-GCM；IndexedDB 按房间与会话隔离。
+服务端只使用必要的 WebSocket 依赖，不连接数据库或保存元数据文件；生产只有一个接流量实例，每个实例只运行一个 Node 进程；互动内容包装在现有加密文字消息内部，不更改密钥协商/签名/AES-GCM；IndexedDB 按房间与会话隔离。
 ## Deployment
-CloudBase 原生 Git main 自动部署与全量切流量，首次仅填环境ID/服务端密钥并验证新版本配置继承；Docker 构建先类型检查/单测。副本0～1供无流量旧容器自动缩容。实际路由来的API/新WS请求事务交接；旧实例排空后释放，不后台争抢。网页回退不依赖构建时间戳或版本标记；旧镜像缓存不影响接管。统一生产域名，不分流或直连旧版本。
+保留 CloudBase 原生 Git main 自动部署和 Docker 构建中的类型检查/单测，无需数据库或服务端 API Key。最大实例1不保证发布期间无版本交叠，必须停止旧实例并断开旧 WebSocket，再启动/切到唯一新实例，接受维护中断；不使用租约交接。最小实例0允许缩零并丢失房间，最小实例1也不保证持久化。重启、回收、部署或回退均使房间失效；页面停止重连并提示重新建房、分享新邀请，不清理浏览器历史。统一生产域名，不分流或直连旧版本。
 ## Open questions
 无阻塞问题。保留上游临时房间语义；本地明文记录不等于设备端加密，README 明示。

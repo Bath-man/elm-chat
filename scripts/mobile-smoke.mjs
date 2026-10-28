@@ -29,6 +29,7 @@ async function text(page, value) {
 }
 async function notice(page, value, color) {
   await page.getByRole('button', { name: '更多功能' }).click();
+  await page.getByRole('menuitem', { name: '发送提醒', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '发送互动' });
   await dialog.getByLabel('提醒文字').fill(value);
   await dialog.getByLabel('自定义颜色（HEX）').fill(color);
@@ -50,10 +51,6 @@ try {
   assert.equal(await a.locator('.bubble').count(), 0);
   assert.equal(await b.locator('.bubble').count(), 0);
   check('two independent mobile sessions join via invite; no demo messages');
-  const routedCheck = a.waitForResponse(response => new URL(response.url()).pathname === '/api/runtime' && response.status() === 200);
-  await a.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-  await routedCheck;
-  check('visible room checks the same-origin runtime route for deployment handoff');
   await text(a, '双端文字测试'); await waitText(b, '双端文字测试');
   await text(b, '收到文字'); await waitText(a, '收到文字');
   check('real-time two-way text');
@@ -69,15 +66,16 @@ try {
   await waitText(b, '对方在线 · 端到端加密');
   check('unconfirmed notice restored after refresh');
   await prompt.getByRole('button', { name: '确认', exact: true }).click();
-  await prompt.waitFor({ state: 'hidden' }); await waitText(a, '√');
-  assert.equal(await a.locator('.bubble.answer').count(), 1);
-  check('notice confirmation sends one green-bordered √');
+  await prompt.waitFor({ state: 'hidden' });
+  await a.locator('.bubble.notice.confirmed').waitFor();
+  assert.equal(await a.locator('.bubble.notice.confirmed').count(), 1);
+  check('notice confirmation updates the original reminder once');
   await notice(a, '排队提醒', '#fff2a8');
   await b.getByRole('dialog', { name: '收到提醒' }).waitFor();
   await a.getByRole('button', { name: '更多功能' }).click();
-  let composer = a.getByRole('dialog', { name: '发送互动' });
-  await composer.getByRole('button', { name: '单选调查', exact: true }).click();
-  await composer.getByLabel('调查问题').fill('今晚吃什么？');
+  await a.getByRole('menuitem', { name: '单选调查', exact: true }).click();
+  const composer = a.getByRole('dialog', { name: '发送互动' });
+  await composer.getByLabel('问卷问题').fill('今晚吃什么？');
   await composer.getByLabel('选项 1').fill('米饭'); await composer.getByLabel('选项 2').fill('面条');
   await composer.getByRole('button', { name: '发送', exact: true }).click();
   await composer.waitFor({ state: 'hidden' });
@@ -101,7 +99,7 @@ try {
   }, replayEvent);
   await b.waitForTimeout(500);
   assert.equal(await b.getByRole('dialog').count(), 0);
-  assert.equal(await a.locator('.bubble.answer').count(), 3);
+  assert.equal(await a.locator('.bubble.answer').count(), 1);
   check('replayed event creates no repeated popup or reply');
   const outgoing = await a.evaluate(() => window.__outgoing.filter(value => JSON.parse(value).data?.payload?.type === 'chat_message'));
   assert(outgoing.length >= 4);

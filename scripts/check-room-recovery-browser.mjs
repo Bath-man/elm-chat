@@ -251,14 +251,53 @@ try {
     check(status === 200);
     destroyed = true;
     await Promise.all([closed(creator), closed(guest)]);
-    // Browser storage still contains the prior capability unless the app has
-    // proactively removed it. Reload must not readmit either original member.
+    // The saved local session remains intact. Reload must not readmit either member.
     for (const p of [creator, guest]) { await p.reload(); await closed(p); }
     const visitor = await newPage(origin);
     await visitor.goto(freshInvite);
     await closed(visitor);
     await delay(1500);
     for (const p of [creator, guest, visitor]) check(await p.locator('.composer').count() === 0);
+  });
+  await step('closed room keeps local history and export available without reconnecting', async () => {
+    const before = await identity(guest);
+    check(before?.session === guestIdentity.session, 'Closing erased the saved session');
+    await guest.getByRole('button', { name: '查看本地记录', exact: true }).click();
+    await guest.locator('.room-subtitle').filter({ hasText: '仅本地记录' }).waitFor();
+    check(await guest.locator('.bubble').count() > 0, 'Local messages disappeared');
+    check(await guest.locator('.composer textarea').isDisabled());
+    await guest.getByRole('button', { name: '更多功能', exact: true }).click();
+    await guest.getByRole('menuitem', { name: '导出记录' }).click();
+    await guest.getByRole('dialog', { name: '导出记录', exact: true }).waitFor();
+    const count = socketCounts.get(guest);
+    await delay(2000);
+    check(socketCounts.get(guest) === count, 'Closed room continued reconnecting');
+  });
+  await step('missing room stops recovery and retains browser credentials', async () => {
+    const missing = await newPage(origin);
+    const id = `missing-${Date.now()}`;
+    const session = crypto.randomUUID();
+    const recovery = 'a'.repeat(43);
+    await missing.goto(origin.href);
+    await missing.evaluate(({ id, session, recovery }) => {
+      localStorage.setItem(`elm-chat:session:${id}`, session);
+      localStorage.setItem(`elm-chat:reconnect:${id}:${session}`, recovery);
+    }, { id, session, recovery });
+    await missing.goto(`${origin.origin}/c/${id}#${new URL(creator.url()).hash.slice(1)}`);
+    await closed(missing);
+    check((await missing.locator('.access-copy').allTextContents()).some(text => text.includes('restart')));
+    const count = socketCounts.get(missing);
+    await delay(2000);
+    check(socketCounts.get(missing) === count);
+    check(await missing.evaluate(({ id, session, recovery }) =>
+      localStorage.getItem(`elm-chat:session:${id}`) === session &&
+      localStorage.getItem(`elm-chat:reconnect:${id}:${session}`) === recovery,
+    { id, session, recovery }), 'Missing room erased browser credentials');
+    await missing.getByRole('button', { name: '查看本地记录', exact: true }).click();
+    check(await missing.locator('.composer textarea').isDisabled());
+    await missing.getByRole('button', { name: '更多功能', exact: true }).click();
+    await missing.getByRole('menuitem', { name: '导入记录' }).click();
+    await missing.getByRole('dialog', { name: '导入记录', exact: true }).waitFor();
   });
   console.log(`PASS room recovery regression (${browser.version()}); no capability artifacts saved`);
 } catch (error) {

@@ -26,8 +26,8 @@ import { roomExpiryReason } from "./expiry.js";
 
 type RoomStorage = RoomMetadata & {
   creatorToken: string;
-  admittedSessions?: (Pick<AttachmentRecord, "sessionId" | "identityKey" | "agreementKey"> & {
-    creator?: boolean;
+  admittedSessions: (Pick<AttachmentRecord, "sessionId" | "identityKey" | "agreementKey"> & {
+    creator: boolean;
     reconnectTokenHash?: string;
     reconnectRevoked?: boolean;
   })[];
@@ -90,9 +90,6 @@ export class Room {
   constructor(private readonly ctx: RoomContext) {
     this.storageReady = this.ctx.blockConcurrencyWhile(async () => {
       this.roomMeta = (await this.ctx.storage.get<RoomStorage>(ROOM_META_KEY)) ?? null;
-      if (this.roomMeta && !Number.isSafeInteger(this.roomMeta.membershipVersion)) {
-        this.roomMeta.membershipVersion = 0;
-      }
       this.invites = new Map((await this.ctx.storage.get<[string, RoomInvite][]>(INVITES_KEY)) ?? []);
     });
   }
@@ -259,6 +256,7 @@ export class Room {
       creatorJoined: false,
       lastActivityAt: bootstrap.createdAt,
       membershipVersion: 0,
+      admittedSessions: [],
       creatorToken: bootstrap.creatorToken
     };
 
@@ -306,9 +304,7 @@ export class Room {
 
     // Seats belong to admitted identities, not live sockets: disconnecting must
     // not let another invitation turn this one-to-one room into a group.
-    const admittedSessions: NonNullable<RoomStorage["admittedSessions"]> = this.roomMeta.admittedSessions ??= this.connectedSessions().map(
-      ({ sessionId, identityKey, agreementKey }) => ({ sessionId, identityKey, agreementKey })
-    );
+    const admittedSessions = this.roomMeta.admittedSessions;
     const admitted = admittedSessions.find((session) => session.sessionId === payload.sessionId);
     if (admitted && (
       admitted.identityKey !== payload.identityKey || admitted.agreementKey !== payload.agreementKey
@@ -331,14 +327,14 @@ export class Room {
       admitted.reconnectTokenHash
         ? presentedHash.length === admitted.reconnectTokenHash.length &&
           timingSafeEqual(Buffer.from(presentedHash), Buffer.from(admitted.reconnectTokenHash))
-        : creatorCredential
+        : false
     ))) {
       ws.send(JSON.stringify(errorEvent("reconnect_required", "Your saved session could not be verified. A valid recovery credential is required.")));
       ws.close(4403, "reconnect required");
       return;
     }
     // Recovery authenticates the original seat, independent of invite expiry.
-    const creator = admitted ? (admitted.creator ?? creatorCredential) : creatorCredential;
+    const creator = admitted ? admitted.creator : creatorCredential;
     const admission: InviteAdmission = admitted
       ? { ok: true, newlyClaimed: false }
       : await this.reserveInviteForJoin(creator, payload);
